@@ -9,6 +9,7 @@
   const DELIVERY_RECORDS_KEY = 'bqa-delivery-records';
   const SCREENING_RECORDS_KEY = 'bqa-screening-records';
   const SEARCH_RUN_STATUS_KEY = 'bqa-search-run-status';
+  const CITY_SUMMARIES_KEY = 'bqa-search-city-summaries';
   const AI_DIAGNOSTIC_LOGS_KEY = 'bqa-ai-diagnostic-logs';
   const DELIVERY_DIAGNOSTIC_LOGS_KEY = 'bqa-delivery-diagnostic-logs';
   const DEFAULT_LIMIT = 150;
@@ -76,7 +77,9 @@
   let deliveryRecords = [];
   let screeningRecords = [];
   let latestRunStatus = null;
-  const historyPages = { ai: 1, manual: 1, companies: 1, contacted: 1, records: 1 };
+  let citySummaries = [];
+  let retryingReviews = false;
+  const historyPages = { ai: 1, manual: 1, companies: 1, contacted: 1, records: 1, review: 1 };
   let searchConditions = [];
   let configRenderRevision = 0;
 
@@ -836,13 +839,19 @@
     const rightTokens = new Set(blockedIdentityTokens(right));
     return blockedIdentityTokens(left).some(token => rightTokens.has(token));
   }
+  function screeningReviewReason(record) {
+    if (record?.manualOverride) return '';
+    if (record?.review?.reason) return record.review.reason;
+    return String(record?.reason || '').includes('AI 未返回判断') ? '旧版 AI 判断不完整，请复查' : '';
+  }
+
   function aiExcludedJobs() {
     const delivered = communicationJobs().filter(job => job.deliveryStatus === '已投递');
     const manual = blockedJobs;
     const hiddenCompanyNames = new Set(blockedCompanies.map(normalizeBlockedText));
     const seen = new Set();
     return [...screeningRecords]
-      .filter(record => record && record.match === false && !record.manualOverride)
+      .filter(record => record && record.match === false && !record.manualOverride && !screeningReviewReason(record))
       .sort((a, b) => Number(b.analyzedAt || 0) - Number(a.analyzedAt || 0))
       .filter(record => {
         if (delivered.some(job => identitiesOverlap(record, job)) || manual.some(job => identitiesOverlap(record, job))) return false;
@@ -869,8 +878,11 @@
     const stale = status.status === 'running' && Date.now() - Number(status.updatedAt || 0) > 60000;
     const labels = { running: stale ? '进度已停止更新' : '正在运行', completed: '已完成', partial: '中途异常，已保留结果', stopped: '用户已停止', 'daily-limit': '达到今日投递上限', failed: '运行失败', interrupted: '任务提前结束' };
     const stamp = status.updatedAt ? new Date(status.updatedAt).toLocaleString('zh-CN', { hour12: false }) : '时间未知';
-    const search = [status.keyword, status.city && `城市 ${status.city}`, status.jobType && `类型 ${status.jobType}`].filter(Boolean).join(' · ') || '当前 BOSS 搜索条件';
-    return `<div class="run-status ${stale ? 'is-stale' : `is-${escapeHtml(status.status || 'unknown')}`}" data-run-status-card><div class="run-status__head"><strong>本轮搜索进度</strong><span>${escapeHtml(labels[status.status] || '状态未知')}</span></div><div class="run-status__metrics"><span>唯一岗位 <b>${Number(status.eligible || 0)}</b></span><span>本页新增 <b>${Number(status.pageNew || 0)}</b></span><span>本页重复 <b>${Number(status.pageRepeated || 0)}</b></span><span>已筛选 <b>${Number(status.screened || 0)}</b></span><span>匹配 <b>${Number(status.matched || 0)}</b></span><span>排除 <b>${Number(status.excluded || 0)}</b></span></div><p>${escapeHtml(search)}${status.page ? ` · 第 ${Number(status.page)} 页` : ''}</p><small>最近更新：${escapeHtml(stamp)} · ${escapeHtml(status.phase || '')}${stale ? '。超过 1 分钟没有可见进度，可能卡住，也可能仍在等待接口重试。' : ''}</small></div>`;
+    const search = [status.keyword, status.city && cityName(status.city), status.jobType && `类型 ${status.jobType}`].filter(Boolean).join(' · ') || '当前 BOSS 搜索条件';
+    const screeningCounts = Number.isFinite(status.aiScreened)
+      ? `<span>历史排除 <b>${Number(status.historyExcluded || 0)}</b></span><span>AI 新筛 <b>${status.aiScreened}</b></span><span>待复查 <b>${Number(status.reviewPending || 0)}</b></span>`
+      : `<span>已筛选 <b>${Number(status.screened || 0)}</b></span>`;
+    return `<div class="run-status ${stale ? 'is-stale' : `is-${escapeHtml(status.status || 'unknown')}`}" data-run-status-card><div class="run-status__head"><strong>当前搜索进度</strong><span>${escapeHtml(labels[status.status] || '状态未知')}</span></div><div class="run-status__metrics"><span>读取 <b>${Number(status.eligible || 0)}</b></span>${screeningCounts}<span>匹配 <b>${Number(status.matched || 0)}</b></span><span>总排除 <b>${Number(status.excluded || 0)}</b></span></div><p>${escapeHtml(search)}${status.page ? ` · 第 ${Number(status.page)} 页` : ''}</p><small>最近更新：${escapeHtml(stamp)} · ${escapeHtml(status.phase || '')}${stale ? '。超过 1 分钟没有可见进度，可能仍在等待接口重试。' : ''}</small></div>`;
   }
   function refreshRunStatusCards() {
     document.querySelectorAll('[data-run-status]').forEach(element => { element.innerHTML = runStatusMarkup(); });
@@ -883,7 +895,7 @@
     historyPages[button.dataset.historyPage] = page;
     if (['ai', 'manual', 'companies'].includes(button.dataset.historyPage)) renderBlocked();
     else if (button.dataset.historyPage === 'contacted') renderContacted();
-    else if (button.dataset.historyPage === 'records') renderRecords();
+    else if (['records', 'review'].includes(button.dataset.historyPage)) renderRecords();
   }
   function refreshBlockedCount() {
     const count = blockedJobs.length + blockedCompanies.length + aiExcludedJobs().length;
@@ -917,16 +929,10 @@
         await write({ [DISMISSED_JOBS_KEY]: jobs.filter(job => !blockedIdentityTokens(job).includes(key)) });
         notice('已将岗位移出手动屏蔽列表。');
       } else if (action === 'restore-ai') {
-        const latest = await read(SCREENING_RECORDS_KEY);
-        const records = Array.isArray(latest) ? latest : [];
-        let restored = false;
-        const updated = records.map(record => {
-          if (!record || !blockedIdentityTokens(record).includes(key) || record.match !== false) return record;
-          restored = true;
-          return { ...record, match: true, manualOverride: true, reason: '用户从屏蔽岗位列表恢复（原 AI 排除）', restoredAt: Date.now() };
-        });
-        if (!restored) throw new Error('岗位记录已变化，请刷新页面后重试。');
-        await write({ [SCREENING_RECORDS_KEY]: updated });
+        const record = aiExcludedJobs().find(item => blockedIdentityTokens(item).includes(key));
+        if (!record?.id) throw new Error('岗位记录已变化，请刷新页面后重试。');
+        const response = await chrome.runtime.sendMessage({ type: 'BQA_RESTORE_AI_EXCLUSION', jobId: record.id });
+        if (!response?.ok) throw new Error(response?.error || '恢复岗位失败');
         notice('岗位已恢复，不会自动投递。');
       }
     } catch (error) {
@@ -953,17 +959,67 @@
     }, '暂时没有进入投递队列的岗位');
     $('[data-panel="contacted"]').innerHTML = `<div class="history-intro"><h2>沟通记录</h2><p>数量统计进入投递/沟通队列的本地唯一岗位，包含排队中、已投递和失败记录；它不包含 AI 排除岗位，也不等于本轮搜索量。</p><div data-run-status>${runStatusMarkup()}</div></div><div class="contact-list"><div class="contact-row contact-head"><span>公司</span><span>岗位名称</span><span>薪资</span><span>投递状态</span><span>沟通时间</span><span>操作</span></div>${page.rows}</div>${page.controls}`;
   }
+  function citySummariesMarkup() {
+    const batchId = latestRunStatus?.batchId;
+    const entries = batchId ? citySummaries.filter(item => item?.batchId === batchId) : citySummaries.slice(0, 24);
+    if (!entries.length) return '<p class="empty-state">完成一次搜索后，这里会显示城市小结。</p>';
+    const rows = entries.map(item => {
+      const state = { completed: '已完成', partial: '中途异常', stopped: '已停止', 'daily-limit': '达到投递上限', failed: '失败', interrupted: '提前结束' }[item.status] || '状态未知';
+      const counts = [
+        `读取 ${Number(item.eligible || 0)}`, `历史复用 ${Number(item.historyReused || 0)}（排除 ${Number(item.historyExcluded || 0)}）`,
+        `AI 新筛 ${Number(item.aiScreened || 0)}`, `匹配 ${Number(item.matched || 0)}`,
+        `待复查 ${Number(item.reviewPending || 0)}`,
+      ].join(' · ');
+      return `<article class="record-row"><span class="record-status">${escapeHtml(state)}</span><div><strong>${escapeHtml(cityName(item.city) || '当前城市')}</strong><small>${escapeHtml(item.keyword || '当前搜索词')}</small><p>${escapeHtml(counts)}</p></div><time>${formatTime(item.finishedAt || item.updatedAt)}</time></article>`;
+    });
+    return `<div class="records-list">${rows.join('')}</div>`;
+  }
+  function refreshCitySummaries() {
+    const target = $('[data-city-summaries]');
+    if (target) target.innerHTML = citySummariesMarkup();
+  }
+  async function handleReviewRetry(event) {
+    const button = event.target.closest('[data-review-job], [data-review-all]');
+    if (!button || retryingReviews) return;
+    const ids = button.hasAttribute('data-review-all')
+      ? [...new Set(screeningRecords.filter(record => record?.id && screeningReviewReason(record)).map(record => String(record.id)))]
+      : [button.dataset.reviewJob];
+    if (!ids.length) return;
+    retryingReviews = true;
+    renderRecords();
+    let resolved = 0;
+    try {
+      for (const jobId of ids) {
+        const response = await chrome.runtime.sendMessage({ type: 'BQA_RETRY_SCREENING_REVIEW', jobId });
+        if (!response?.ok) throw new Error(response?.error || 'AI 复查失败');
+        if (response.resolved) resolved += 1;
+      }
+      notice(`已复查 ${ids.length} 个岗位，${resolved} 个获得明确判断，${ids.length - resolved} 个仍待复查。`);
+    } catch (error) {
+      notice(error.message || '复查未能完成', 'error');
+    } finally {
+      retryingReviews = false;
+      renderRecords();
+    }
+  }
   function renderRecords() {
-    const records = [...screeningRecords].sort((a, b) => Number(b.analyzedAt || 0) - Number(a.analyzedAt));
+    const records = screeningRecords.filter(record => record?.id && !screeningReviewReason(record) && typeof record.match === 'boolean')
+      .sort((a, b) => Number(b.analyzedAt || 0) - Number(a.analyzedAt || 0));
+    const pending = screeningRecords.filter(record => record?.id && screeningReviewReason(record))
+      .sort((a, b) => Number(b.review?.updatedAt || b.analyzedAt || 0) - Number(a.review?.updatedAt || a.analyzedAt || 0));
+    const review = paginatedRows(pending, 'review', record => `<div class="rule-row"><span class="rule-type">待复查</span><span class="rule-content">${detailLink(record, '岗位名称待确认')}<small>${escapeHtml(record.company || '')} · ${escapeHtml(screeningReviewReason(record))}</small></span><button type="button" class="rule-action" data-review-job="${escapeHtml(record.id)}" ${retryingReviews ? 'disabled' : ''}>重试此岗位</button></div>`, '暂时没有待复查岗位');
     const page = paginatedRows(records, 'records', record => {
       const profileNames = Array.isArray(record.matchedProfiles) ? record.matchedProfiles.map(profile => profile.name).join('、') : '';
       return `<article class="record-row ${record.match ? 'is-match' : ''}"><span class="record-status">${record.match ? '匹配' : '不匹配'}</span><div><strong>${record.detailUrl ? `<a href="${escapeHtml(record.detailUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(record.title || '岗位名称待确认')}</a>` : escapeHtml(record.title || '岗位名称待确认')}</strong><small>${escapeHtml(record.company || '公司信息待确认')}　${escapeHtml(record.salary || '薪资待确认')}　版本 ${escapeHtml(record.screeningVersion || '历史')}${profileNames ? `　匹配岗位：${escapeHtml(profileNames)}` : ''}</small><p>${escapeHtml(record.reason || 'AI 未返回判断')}</p></div><time>${formatTime(record.analyzedAt)}</time></article>`;
     }, '还没有识别记录。回到 BOSS 岗位列表，点击“AI 精准投递”即可开始积累。');
-    $('[data-panel="records"]').innerHTML = `<div class="history-intro"><h2>识别记录</h2><p>扫描按 BOSS 列表逐页读取；岗位按 ID 去重并更新，历史记录不设固定条数上限。</p><div data-run-status>${runStatusMarkup()}</div></div><div class="records-list">${page.rows}</div>${page.controls}`;
+    $('[data-panel="records"]').innerHTML = `<div class="history-intro"><h2>识别记录</h2><p>扫描按 BOSS 列表逐页读取；岗位按 ID 去重并更新，历史记录不设固定条数上限。</p><div data-run-status>${runStatusMarkup()}</div></div>
+      <section class="list-section"><h3>待复查岗位 <span>${pending.length}</span></h3><p>模型漏答或请求失败的岗位保存在这里。手动重试会按当前条件判断，结果保存到识别记录。</p><button type="button" class="button" data-review-all ${retryingReviews || !pending.length ? 'disabled' : ''}>${retryingReviews ? '正在复查…' : '只重试待复查岗位'}</button><div class="rule-list">${review.rows}</div>${review.controls}</section>
+      <section class="list-section"><h3>城市搜索小结</h3><p>同一城市的不同搜索词各显示一条，待复查数记录该次搜索结束时的状态。</p><div data-city-summaries>${citySummariesMarkup()}</div></section>
+      <section class="list-section"><h3>已完成判断</h3><div class="records-list">${page.rows}</div>${page.controls}</section>`;
   }
   async function saveSettings(updates) { const current = await read(SETTINGS_KEY) || {}; const backup = Object.keys(current).length ? current : await read(SETTINGS_BACKUP_KEY) || {}; settings = { ...current, ...updates }; settings.profiles = normalizeProfiles(settings.profiles, settings).map(profile => ({ ...profile, version: profileVersion(profile, settings) })); settings.screeningVersion = screeningVersionFor(settings); await write({ [SETTINGS_KEY]: settings, [SETTINGS_BACKUP_KEY]: backup }); }
   async function init() {
-    const [current, backup, jobs, companies, delivered, records, queued, runStatus] = await Promise.all([read(SETTINGS_KEY), read(SETTINGS_BACKUP_KEY), read(DISMISSED_JOBS_KEY), read(HIDDEN_COMPANIES_KEY), read(DELIVERED_KEY), read(SCREENING_RECORDS_KEY), read(DELIVERY_RECORDS_KEY), read(SEARCH_RUN_STATUS_KEY)]);
+    const [current, backup, jobs, companies, delivered, records, queued, runStatus, summaries] = await Promise.all([read(SETTINGS_KEY), read(SETTINGS_BACKUP_KEY), read(DISMISSED_JOBS_KEY), read(HIDDEN_COMPANIES_KEY), read(DELIVERED_KEY), read(SCREENING_RECORDS_KEY), read(DELIVERY_RECORDS_KEY), read(SEARCH_RUN_STATUS_KEY), read(CITY_SUMMARIES_KEY)]);
     const currentSettings = current && typeof current === 'object' && !Array.isArray(current) ? current : {};
     const backupSettings = backup && typeof backup === 'object' && !Array.isArray(backup) ? backup : {};
     const selectedSettings = Object.keys(currentSettings).length ? currentSettings : backupSettings;
@@ -990,6 +1046,7 @@
     deliveryRecords = Array.isArray(queued) ? queued.filter(Boolean) : [];
     screeningRecords = Array.isArray(records) ? records : [];
     latestRunStatus = runStatus && typeof runStatus === 'object' ? runStatus : null;
+    citySummaries = Array.isArray(summaries) ? summaries.filter(Boolean) : [];
     searchConditions = normalizeConditions(settings.autoSearch);
     const storedSearchConditions = Array.isArray(settings.autoSearch?.conditions) ? settings.autoSearch.conditions : [];
     const hasLegacyRunTime = Object.prototype.hasOwnProperty.call(settings.autoSearch || {}, 'time') || storedSearchConditions.some(condition => Object.prototype.hasOwnProperty.call(condition || {}, 'time'));
@@ -1007,8 +1064,14 @@
     $('#contacted-count').textContent = communicationJobs().length;
     renderBasic(); renderAutoSearch(); renderBlocked(); renderContacted(); renderRecords();
     $('[data-panel="blocked"]').addEventListener('click', event => { void handleBlockedAction(event); });
+    $('[data-panel="records"]').addEventListener('click', event => { void handleReviewRetry(event); });
     document.querySelectorAll('.settings-panel').forEach(panel => panel.addEventListener('click', handleHistoryPage));
-    void loadBossCityDirectory().then(loaded => { if (loaded) refreshTemplateCityPickers(); });
+    void loadBossCityDirectory().then(loaded => {
+      if (!loaded) return;
+      refreshTemplateCityPickers();
+      refreshRunStatusCards();
+      refreshCitySummaries();
+    });
     document.querySelectorAll('[data-tab]').forEach(button => button.addEventListener('click', () => chooseTab(button.dataset.tab)));
     chooseTab(tabFromQuery);
   }
@@ -1041,6 +1104,12 @@
     if (changes[SEARCH_RUN_STATUS_KEY]) {
       latestRunStatus = changes[SEARCH_RUN_STATUS_KEY].newValue && typeof changes[SEARCH_RUN_STATUS_KEY].newValue === 'object' ? changes[SEARCH_RUN_STATUS_KEY].newValue : null;
       refreshRunStatusCards();
+      refreshCitySummaries();
+    }
+    if (changes[CITY_SUMMARIES_KEY]) {
+      const summaries = changes[CITY_SUMMARIES_KEY].newValue;
+      citySummaries = Array.isArray(summaries) ? summaries.filter(Boolean) : [];
+      refreshCitySummaries();
     }
     if (blockedRefresh) renderBlocked();
     if (refresh) {

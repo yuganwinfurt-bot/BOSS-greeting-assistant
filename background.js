@@ -345,6 +345,10 @@ const LEGACY_AUTO_SEARCH_ALARM_PREFIX = 'bqa-auto-search-daily';
 const AUTO_SEARCH_PENDING_KEY = 'bqa-auto-search-pending';
 const AUTO_SEARCH_BATCH_KEY = 'bqa-auto-search-batch';
 const SETTINGS_KEY = 'bqa-ai-settings';
+const SCREENING_RECORDS_KEY = 'bqa-screening-records';
+const CITY_SUMMARIES_KEY = 'bqa-search-city-summaries';
+let screeningHistoryMutation = Promise.resolve();
+const activeReviewRetries = new Set();
 const DELIVERED_KEY = 'bqa-delivered-jobs';
 const DELIVERY_RECORDS_KEY = 'bqa-delivery-records';
 const DELIVERY_SEND_LOCKS_KEY = 'bqa-delivery-send-locks';
@@ -1197,8 +1201,10 @@ function abortAutoSearchBatch(batchId) {
   return mutateSearchSequence(batch => batch?.id === batchId ? { batch: null, value: { ok: true } } : { value: { ok: true, stale: true } });
 }
 
-async function screenJobs(settings, jobs, signal = AbortSignal.timeout(SCREENING_DEADLINE_MS)) {
+async function screenJobs(settings, jobs) {
+  const signal = AbortSignal.timeout(SCREENING_DEADLINE_MS);
   const profiles = screeningProfiles(settings);
+  if (!profiles.length) throw new Error('没有启用的岗位条件');
   const profilePrompt = JSON.stringify(profiles.map(profile => ({ id: profile.id, name: profile.name, targetProfile: profile.targetProfile || '未填写' })));
   const data = await callDeepSeek({
     apiKey: settings.apiKey, apiUrl: settings.apiUrl,
@@ -1229,38 +1235,138 @@ async function screenJobs(settings, jobs, signal = AbortSignal.timeout(SCREENING
     list = parseScreeningResult(raw);
   } catch (error) {
     void recordAiDiagnostic({ action: '岗位筛选', phase: 'parse-error', model: settings.model, endpoint: diagnosticEndpoint(settings.apiUrl), jobIds: jobs.map(job => job.id), profileIds: profiles.map(profile => profile.id), rawLength: raw.length, rawPreview: diagnosticPreview(raw), error: error.message });
-    if (jobs.length <= 1) throw error;
-    list = [];
+    return jobs.map(job => ({ ...job, screeningError: 'AI 返回的筛选结果无法解析' }));
   }
-  const result = new Map(list.map(item => [String(item.id), item]));
+  const result = new Map();
+  for (const item of list) {
+    const id = String(item.id);
+    result.set(id, result.has(id) ? null : item);
+  }
   const screened = [];
   for (const job of jobs) {
     const item = result.get(String(job.id));
-    const evaluations = (Array.isArray(item?.evaluations) ? item.evaluations : []).map(evaluation => {
-      const profile = profiles.find(candidate => String(candidate.id) === String(evaluation?.profileId));
-      return profile ? { ...evaluation, profileId: profile.id, profileName: profile.name } : null;
-    }).filter(Boolean);
-    // 批量回答有漏项时，只重问受影响的岗位，避免把批量漏答当作排除结果。
-    if (jobs.length > 1 && (!item || profiles.some(profile => !evaluations.some(evaluation =>
-      evaluation.profileId === profile.id && typeof evaluation.match === 'boolean'
-    )))) {
-      const [retried] = await screenJobs(settings, [job], signal);
-      screened.push(retried);
+    const evaluations = Array.isArray(item?.evaluations) ? item.evaluations : [];
+    const normalizedEvaluations = profiles.map(profile => {
+      const answers = evaluations.filter(evaluation => String(evaluation?.profileId) === profile.id);
+      if (answers.length !== 1 || typeof answers[0].match !== 'boolean') return null;
+      return { ...answers[0], profileId: profile.id, profileName: profile.name, profileVersion: profile.version };
+    });
+    const missingProfiles = profiles.filter((_, index) => !normalizedEvaluations[index]);
+    if (missingProfiles.length) {
+      screened.push({ ...job, screeningError: `AI 未给出完整判断（${missingProfiles.map(profile => profile.name).join('、')}）` });
       continue;
     }
-    const normalizedEvaluations = profiles.map(profile => evaluations.find(evaluation => String(evaluation.profileId) === String(profile.id)) || { profileId: profile.id, profileName: profile.name, match: false, reason: 'AI 未返回判断' });
     const matches = normalizedEvaluations.filter(item => item.match);
     const best = matches[0] || normalizedEvaluations[0] || {};
     screened.push({
       ...job,
       match: matches.length > 0,
-      reason: matches.map(item => `${item.profileName || '岗位'}：${item.reason || '匹配'}`).join('；') || best.reason || 'AI 未返回判断',
-      profileMatches: normalizedEvaluations.map(item => ({ profileId: item.profileId, profileName: item.profileName, profileVersion: profiles.find(profile => profile.id === item.profileId)?.version || '', match: Boolean(item.match), reason: item.reason || '' })),
+      reason: matches.map(item => `${item.profileName || '岗位'}：${item.reason || '匹配'}`).join('；') || best.reason || 'AI 判断为不匹配',
+      profileMatches: normalizedEvaluations.map(({ profileId, profileName, profileVersion, match, reason }) => ({ profileId, profileName, profileVersion, match, reason: reason || '' })),
       matchedProfiles: matches.map(item => ({ id: item.profileId, name: item.profileName, version: profiles.find(profile => profile.id === item.profileId)?.version || '' })),
       bestProfile: profiles.find(profile => profile.id === (matches[0]?.profileId || best.profileId)) || profiles[0],
     });
   }
   return screened;
+}
+
+function serializeScreeningHistory(task) {
+  const operation = screeningHistoryMutation.then(task);
+  screeningHistoryMutation = operation.catch(() => {});
+  return operation;
+}
+
+function mutateScreeningHistory(key, update) {
+  return serializeScreeningHistory(async () => {
+    const data = await chrome.storage.local.get(key);
+    const next = update(Array.isArray(data[key]) ? data[key] : []);
+    if (next) await chrome.storage.local.set({ [key]: next });
+  });
+}
+
+function saveCitySummary(summary) {
+  return serializeScreeningHistory(async () => {
+    const runKey = 'bqa-search-run-status';
+    const data = await chrome.storage.local.get([CITY_SUMMARIES_KEY, runKey]);
+    const records = Array.isArray(data[CITY_SUMMARIES_KEY]) ? data[CITY_SUMMARIES_KEY] : [];
+    const updates = { [CITY_SUMMARIES_KEY]: [summary, ...records.filter(record => record?.runId !== summary.runId)].slice(0, 180) };
+    if (!data[runKey] || data[runKey].runId === summary.runId) updates[runKey] = summary;
+    await chrome.storage.local.set(updates);
+  });
+}
+
+function saveScreeningOutcomes(jobs, screeningVersion) {
+  return mutateScreeningHistory(SCREENING_RECORDS_KEY, existing => {
+    const byId = new Map(existing.filter(record => record?.id).map(record => [String(record.id), record]));
+    const updated = new Map();
+    for (const job of jobs) {
+      const id = String(job?.id || '');
+      if (!id) continue;
+      const previous = updated.get(id) || byId.get(id) || {};
+      if (previous.manualOverride && !job.manualOverride) continue;
+      const attemptStartedAt = Number(job.screeningAttemptStartedAt) || Date.now();
+      if (!job.manualOverride && Number(previous.screeningAttemptStartedAt || 0) > attemptStartedAt) continue;
+      const record = {
+        ...previous, id, title: job.title || previous.title || '岗位名称待确认',
+        company: job.company || previous.company || '公司信息待确认',
+        salary: job.salary || previous.salary || '', tags: job.tags || previous.tags || '',
+        summary: job.summary || previous.summary || '', detailUrl: job.detailUrl || previous.detailUrl || '',
+        screeningAttemptStartedAt: attemptStartedAt,
+      };
+      if (job.screeningError) {
+        record.review = { reason: String(job.screeningError).slice(0, 240), updatedAt: Date.now() };
+      } else {
+        const results = new Map();
+        const previousResults = Array.isArray(previous.profileMatches) ? previous.profileMatches : [];
+        const freshResults = Array.isArray(job.profileMatches) ? job.profileMatches : [];
+        for (const item of [...previousResults, ...freshResults]) {
+          if (item?.profileId) results.set(`${item.profileId}:${item.profileVersion || ''}`, item);
+        }
+        Object.assign(record, {
+          match: Boolean(job.match), reason: job.reason || 'AI 已给出判断',
+          manualOverride: Boolean(job.manualOverride), profileMatches: [...results.values()],
+          matchedProfiles: job.matchedProfiles || [], bestProfile: job.bestProfile || null,
+          screeningVersion: String(screeningVersion || ''), analyzedAt: Date.now(),
+        });
+        delete record.review;
+      }
+      updated.set(id, record);
+    }
+    return updated.size ? [...updated.values(), ...existing.filter(record => !updated.has(String(record?.id)))] : null;
+  });
+}
+
+async function retryScreeningReview(jobId) {
+  const id = String(jobId || '');
+  if (!id || activeReviewRetries.has(id)) throw new Error('该岗位正在复查或缺少岗位 ID');
+  activeReviewRetries.add(id);
+  try {
+    const data = await chrome.storage.local.get([SETTINGS_KEY, 'bqa-ai-settings-backup', SCREENING_RECORDS_KEY]);
+    const records = Array.isArray(data[SCREENING_RECORDS_KEY]) ? data[SCREENING_RECORDS_KEY] : [];
+    const record = records.find(item => String(item?.id) === id);
+    if (!record || record.manualOverride || !(record.review || String(record.reason || '').includes('AI 未返回判断'))) {
+      return { ok: true, resolved: true };
+    }
+    const current = data[SETTINGS_KEY] || {};
+    const settings = Object.keys(current).length ? current : data['bqa-ai-settings-backup'] || {};
+    if (!settings.apiKey || !settings.apiUrl || !settings.model) throw new Error('请先完成 AI 接口配置');
+    const startedAt = Date.now();
+    let result;
+    try {
+      const job = { id, title: record.title, company: record.company, salary: record.salary,
+        tags: record.tags, summary: record.summary, detailUrl: record.detailUrl };
+      [result] = await screenJobs(settings, [job]);
+    } catch (error) {
+      result = { id, screeningError: String(error?.message || 'AI 复查失败').replaceAll(settings.apiKey || '\u0000', '[已隐藏 API Key]').replace(/sk-[A-Za-z0-9_-]{12,}/g, '[已隐藏密钥]') };
+    }
+    await saveScreeningOutcomes([{ ...result, screeningAttemptStartedAt: startedAt }], settings.screeningVersion);
+    if (/HTTP\s+(400|401|403|404|429)\b|没有启用的岗位条件/.test(result.screeningError || '')) {
+      throw new Error(result.screeningError);
+    }
+    return { ok: true, resolved: !result.screeningError };
+  } finally {
+    activeReviewRetries.delete(id);
+  }
 }
 
 function parseScreeningResult(raw) {
@@ -1465,6 +1571,33 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   if (message.type === 'BQA_RUN_AUTO_SEARCH_BATCH') {
     startAutoSearchBatch(message.conditions, sendResponse);
+    return true;
+  }
+  if (message.type === 'BQA_SAVE_SCREENING_OUTCOMES') {
+    saveScreeningOutcomes(Array.isArray(message.jobs) ? message.jobs : [], message.screeningVersion)
+      .then(() => sendResponse({ ok: true })).catch(error => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+  if (message.type === 'BQA_RETRY_SCREENING_REVIEW') {
+    retryScreeningReview(message.jobId)
+      .then(sendResponse).catch(error => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+  if (message.type === 'BQA_RESTORE_AI_EXCLUSION') {
+    mutateScreeningHistory(SCREENING_RECORDS_KEY, records => {
+      const job = records.find(record => String(record?.id) === String(message.jobId) && record?.match === false);
+      if (!job) throw new Error('岗位记录已变化，请刷新页面后重试。');
+      return records.map(record => record === job
+        ? { ...record, match: true, manualOverride: true, review: null, reason: '用户从屏蔽岗位列表恢复（原 AI 排除）', restoredAt: Date.now() }
+        : record);
+    }).then(() => sendResponse({ ok: true })).catch(error => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
+  if (message.type === 'BQA_SAVE_CITY_SUMMARY') {
+    const summary = message.summary;
+    if (!summary?.runId) return;
+    saveCitySummary(summary)
+      .then(() => sendResponse({ ok: true })).catch(error => sendResponse({ ok: false, error: error.message }));
     return true;
   }
   if (message.type === 'BQA_AUTO_SEARCH_BATCH_COMPLETE') {

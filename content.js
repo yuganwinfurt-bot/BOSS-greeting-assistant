@@ -134,9 +134,14 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
     });
   }
 
+  function screeningNeedsReview(record) {
+    return !record?.manualOverride && Boolean(record?.review || String(record?.reason || '').includes('AI 未返回判断'));
+  }
+
   function validProfileResults(record, profiles, globalVersion) {
     const results = new Map();
     for (const result of Array.isArray(record?.profileMatches) ? record.profileMatches : []) {
+      if (result?.reason === 'AI 未返回判断') continue;
       const profile = profiles.find(item => String(item.id) === String(result?.profileId));
       if (!profile) continue;
       const storedVersion = String(result.profileVersion || '');
@@ -145,7 +150,7 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
       }
     }
     // 兼容较早版本只保存了岗位整体判断、没有 profileMatches 的记录。
-    if (!results.size && profiles.length === 1 && record?.id
+    if (!results.size && profiles.length === 1 && record?.id && !screeningNeedsReview(record)
       && String(record.screeningVersion || '') === String(globalVersion || '')) {
       const profile = profiles[0];
       results.set(String(profile.id), {
@@ -431,44 +436,8 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
 
   async function saveScreeningRecords(jobs, screeningVersion) {
     if (!jobs?.length) return;
-    const existing = await readStorage(SCREENING_RECORDS_KEY, []);
-    const analyzedAt = Date.now();
-    const existingById = new Map((Array.isArray(existing) ? existing : []).map(record => [String(record?.id), record]));
-    const records = jobs.map(job => {
-      const previous = existingById.get(String(job.id));
-      const profileResults = new Map();
-      for (const result of Array.isArray(previous?.profileMatches) ? previous.profileMatches : []) {
-        if (result?.profileId) profileResults.set(`${result.profileId}:${result.profileVersion || ''}`, result);
-      }
-      for (const result of Array.isArray(job.profileMatches) ? job.profileMatches : []) {
-        if (result?.profileId) profileResults.set(`${result.profileId}:${result.profileVersion || ''}`, result);
-      }
-      return ({
-      ...previous,
-      id: job.id,
-      title: job.title || '岗位名称待确认',
-      company: job.company || '公司信息待确认',
-      salary: job.salary || '薪资待确认',
-      tags: job.tags || '',
-      summary: job.summary || '',
-      detailUrl: job.detailUrl || '',
-      match: Boolean(job.match),
-      reason: job.reason || 'AI 未返回判断',
-      manualOverride: Boolean(job.manualOverride),
-      matchedProfiles: Array.isArray(job.matchedProfiles) ? job.matchedProfiles : [],
-      profileMatches: [...profileResults.values()],
-      bestProfile: job.bestProfile || null,
-      // 版本是由简历、目标画像和薪资范围内容计算出的指纹，必须保留完整字符串；
-      // 旧版这里用 Number() 会把 `v1-xxxxxxxx` 全部写成 1，导致后续无法复用识别结果。
-      screeningVersion: String(screeningVersion || screeningVersionFor({})),
-      analyzedAt,
-    });
-    });
-    const updatedIds = new Set(records.map(record => String(record.id)));
-    const retained = (Array.isArray(existing) ? existing : [])
-      .filter(record => !updatedIds.has(String(record?.id)));
-    // 岗位识别历史按岗位 ID 去重，不设置固定条数上限。
-    await setStored(SCREENING_RECORDS_KEY, [...records, ...retained]);
+    const response = await sendBackgroundRequest({ type: 'BQA_SAVE_SCREENING_OUTCOMES', jobs, screeningVersion }, '保存识别结果');
+    if (!response?.ok) throw new Error(response?.error || '无法保存识别结果');
   }
 
   const normalize = value => (value || '').replace(/\s+/g, '').trim();
@@ -882,7 +851,7 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
     return false;
   }
 
-  async function screenJobsInChunks(settings, jobs, onProgress, isCancelled, chunkSize = SCREENING_CHUNK_SIZE, onChunkScreened, onLog, concurrency = 1) {
+  async function screenJobsInChunks(settings, jobs, onProgress, isCancelled, chunkSize = SCREENING_CHUNK_SIZE, onChunkScreened, onLog, { concurrency = 1, onChunkFailed } = {}) {
     const result = [];
     const requestChunk = async (start) => {
       const chunk = jobs.slice(start, start + chunkSize);
@@ -907,12 +876,23 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
           }),
         ]);
         if (!response?.ok) throw new Error(response?.error || 'AI 筛选未完成');
-        const matched = response.jobs.filter(job => job.match).length;
-        onLog?.(`AI 筛选第 ${batch} 批完成：匹配 ${matched} 个，排除 ${response.jobs.length - matched} 个，耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)} 秒`);
-        return { jobs: response.jobs };
+        const byId = new Map((response.jobs || []).map(job => [String(job.id), job]));
+        const outcomes = chunk.map(job => ({
+          ...(byId.get(String(job.id)) || { ...job, screeningError: '后台漏掉了该岗位的判断' }),
+          screeningAttemptStartedAt: startedAt,
+        }));
+        const completed = outcomes.filter(job => !job.screeningError);
+        const failed = outcomes.filter(job => job.screeningError);
+        const matched = completed.filter(job => job.match).length;
+        onLog?.(`AI 筛选第 ${batch} 批完成：匹配 ${matched} 个，排除 ${completed.length - matched} 个，待复查 ${failed.length} 个，耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)} 秒`);
+        return { completed, failed, requestSettings };
       } catch (error) {
-        if (!isCancelled?.()) onLog?.(`AI 筛选第 ${batch} 批失败：${error?.message || '未知错误'}`, 'error');
-        return { error };
+        const reason = String(error?.message || 'AI 筛选未完成');
+        if (!isCancelled?.()) onLog?.(`AI 筛选第 ${batch} 批失败，已记为待复查：${reason}`, 'error');
+        return {
+          completed: [], failed: chunk.map(job => ({ ...job, screeningError: reason, screeningAttemptStartedAt: startedAt })), requestSettings,
+          fatal: /HTTP\s+(400|401|403|404|429)\b|没有启用的岗位条件/.test(reason) ? error : null,
+        };
       } finally {
         clearTimeout(replyTimer);
         clearInterval(waitingTimer);
@@ -926,20 +906,23 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
       for (let index = start; index < Math.min(start + windowSize, jobs.length); index += chunkSize) {
         pending.push(requestChunk(index));
       }
-      let firstError;
+      let fatal;
       // 按列表顺序保存和入队，避免模型回复先后改变投递顺序。
       for (const request of pending) {
         const outcome = await request;
         throwIfDiscoveryCancelled(isCancelled);
-        if (outcome.error) {
-          firstError ||= outcome.error;
-          continue;
+        if (outcome.failed.length) {
+          if (!onChunkFailed) throw new Error(outcome.failed[0].screeningError);
+          await onChunkFailed(outcome.failed, outcome.requestSettings);
         }
-        await onChunkScreened?.(outcome.jobs);
-        result.push(...outcome.jobs);
+        if (outcome.completed.length) {
+          await onChunkScreened?.(outcome.completed, outcome.requestSettings);
+          result.push(...outcome.completed);
+        }
         onProgress?.(result.length, jobs.length);
+        fatal ||= outcome.fatal;
       }
-      if (firstError) throw firstError;
+      if (fatal) throw fatal;
     }
     return result;
   }
@@ -996,6 +979,10 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
   async function collectAndScreenRecommendedJobs(settings, delivered, onProgress, isCancelled, { shouldAutoDeliver, shouldStopForDailyLimit, onAutoDeliver, onLog } = {}) {
     const recommended = [];
     const analyzed = [];
+    const pendingReview = new Map();
+    let historyReused = 0;
+    let historyExcluded = 0;
+    let aiScreened = 0;
     let pageNew = 0;
     let pageRepeated = 0;
     const progressSnapshot = extra => {
@@ -1013,6 +1000,10 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
         excluded: excluded.length,
         pageNew,
         pageRepeated,
+        historyReused,
+        historyExcluded,
+        aiScreened,
+        reviewPending: pendingReview.size,
         jobs: [...matched, ...excluded.slice(-MAX_LIVE_EXCLUDED_JOBS)],
         ...extra,
       };
@@ -1027,20 +1018,79 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
     const reusableRecords = new Map((Array.isArray(storedRecords) ? storedRecords : [])
       .filter(record => record?.id)
       .map(record => [String(record.id), record]));
-    const mergeAndPersistScreenedJobs = async jobs => {
+    const mergeAndPersistScreenedJobs = async (jobs, requestSettings = settings, activeProfiles = screeningProfilesFor(requestSettings)) => {
       const merged = (jobs || []).map(job => combineProfileScreeningResult(
         job,
         reusableRecords.get(String(job.id)),
         job.profileMatches,
-        settings,
-        profiles,
+        requestSettings,
+        activeProfiles,
       ));
-      await saveScreeningRecords(merged, settings.screeningVersion);
+      await saveScreeningRecords(merged, requestSettings.screeningVersion);
       merged.forEach(job => reusableRecords.set(String(job.id), {
         ...job,
-        screeningVersion: String(settings.screeningVersion || ''),
+        screeningVersion: String(requestSettings.screeningVersion || ''),
       }));
       return merged;
+    };
+    const recordFailures = async (jobs, historicalProfiles = null) => {
+      const failed = jobs.map(job => ({
+        ...job,
+        screeningError: String(job.screeningError || 'AI 未完成筛选')
+          .replaceAll(settings.apiKey || '\u0000', '[已隐藏 API Key]').replace(/sk-[A-Za-z0-9_-]{12,}/g, '[已隐藏密钥]'),
+      }));
+      for (const job of failed) pendingReview.set(String(job.id), { job, historicalProfiles });
+      await saveScreeningRecords(failed, settings.screeningVersion);
+    };
+    const processScreenedJobs = async (screened, listPage, options = {}) => {
+      const alreadyShown = options.alreadyShown === true;
+      let startIndex = options.startIndex ?? analyzed.length;
+      if (!screened.length) return;
+      const matchedJobs = screened.filter(job => job.match);
+      if (!alreadyShown) {
+        startIndex = analyzed.length;
+        analyzed.push(...screened);
+        // 先展示 AI 判断结果；只有匹配岗位需要读取后续投递所需的详情。
+        onProgress?.(progressSnapshot({ page: listPage + 1, phase: matchedJobs.length ? '正在读取匹配岗位详情' : '当前批次筛选完成' }));
+      }
+      if (!matchedJobs.length) {
+        onProgress?.(progressSnapshot({ page: listPage + 1, phase: '当前批次筛选完成' }));
+        return;
+      }
+      // 不匹配岗位只进入“被排除岗位”列表，不参与投递，无需逐个读取完整 JD。
+      const cached = await cacheDirectDeliveryData(matchedJobs, listPage, progress => {
+        const cachedJobs = progress.cachedJobs || [];
+        const snapshot = progressSnapshot({ page: listPage + 1, phase: '正在整理匹配岗位信息' });
+        const cachedById = new Map(cachedJobs.map(job => [String(job.id), job]));
+        onProgress?.({ ...snapshot, recommended: recommended.length + cachedJobs.length, ...progress,
+          jobs: snapshot.jobs.map(job => cachedById.get(String(job.id)) || job) });
+      }, isCancelled, async cachedJob => {
+        if (cachedJob.match && shouldAutoDeliver?.() && !autoQueuedIds.has(cachedJob.id)) {
+          // 投递已由全局队列串行控制；不能让发送过程阻塞后续岗位的识别和预览渲染。
+          autoQueuedIds.add(cachedJob.id);
+          void onAutoDeliver?.(cachedJob).catch(error => console.warn('[BOSS 智能投递] 自动投递任务未能启动', error));
+        }
+      }, onLog);
+      const cachedById = new Map(cached.map(job => [job.id, job]));
+      for (let index = startIndex; index < startIndex + screened.length; index += 1) {
+        const job = analyzed[index];
+        const cachedJob = cachedById.get(job.id);
+        if (cachedJob) {
+          analyzed[index] = { ...job, ...cachedJob };
+        } else if (job.match) {
+          // 缓存失败不等于无法投递：批量发送时仍可从当前列表卡片重新读取元数据。
+          const fallbackJob = { ...job, reason: '岗位信息读取不完整，投递时重新读取' };
+          analyzed[index] = fallbackJob;
+          if (shouldAutoDeliver?.() && !autoQueuedIds.has(fallbackJob.id)) {
+            autoQueuedIds.add(fallbackJob.id);
+            void onAutoDeliver?.(fallbackJob).catch(error => console.warn('[BOSS 智能投递] 自动投递任务未能启动', error));
+          }
+        }
+      }
+      for (const job of cached) {
+        recommended.push(job);
+        if (recommended.length >= dailyDeliveryLimit) break;
+      }
     };
     let pagesMoved = 0;
     let eligible = 0;
@@ -1052,7 +1102,7 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
       // 必须复筛该画像下旧版本排除的记录，不能让旧判断覆盖新规则。
       const historicalGroups = new Map();
       for (const record of reusableRecords.values()) {
-        if (record.match !== false || record.manualOverride) continue;
+        if (record.match !== false || record.manualOverride || screeningNeedsReview(record)) continue;
         const currentResults = validProfileResults(record, profiles, settings.screeningVersion);
         const storedProfileResults = Array.isArray(record.profileMatches) ? record.profileMatches : [];
         const hasLegacyVersionChange = !storedProfileResults.length
@@ -1110,6 +1160,7 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
         let skippedHistoricalExclusions = 0;
         for (const job of pageJobs) {
           const record = reusableRecords.get(String(job.id));
+          if (screeningNeedsReview(record)) continue;
           if (record?.manualOverride || validProfileResults(record, profiles, settings.screeningVersion).size > 0) {
             cachedIds.add(job.id);
           } else if (skipHistoricalAiExclusions && record?.match === false) {
@@ -1147,65 +1198,18 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
               }, record, [], settings, profiles);
             });
           const pendingScreening = candidates.filter(job => !cachedIds.has(job.id));
+          historyReused += reusable.length;
+          historyExcluded += reusable.filter(job => !job.match).length;
           let cachePipeline = Promise.resolve();
-          const processScreenedJobs = async (screened, options = {}) => {
-            const alreadyShown = options.alreadyShown === true;
-            let startIndex = options.startIndex ?? analyzed.length;
-            if (!screened.length) return;
-            const matchedJobs = screened.filter(job => job.match);
-            if (!alreadyShown) {
-              startIndex = analyzed.length;
-              analyzed.push(...screened);
-              // 先展示 AI 判断结果；只有匹配岗位需要读取后续投递所需的详情。
-              onProgress?.(progressSnapshot({ page: listPage + 1, phase: matchedJobs.length ? '正在读取匹配岗位详情' : '当前批次筛选完成' }));
-            }
-            if (!matchedJobs.length) {
-              onProgress?.(progressSnapshot({ page: listPage + 1, phase: '当前批次筛选完成' }));
-              return;
-            }
-            // 不匹配岗位只进入“被排除岗位”列表，不参与投递，无需逐个读取完整 JD。
-            const cached = await cacheDirectDeliveryData(matchedJobs, listPage, progress => {
-              const cachedJobs = progress.cachedJobs || [];
-              const snapshot = progressSnapshot({ page: listPage + 1, phase: '正在整理匹配岗位信息' });
-              const cachedById = new Map(cachedJobs.map(job => [String(job.id), job]));
-              onProgress?.({ ...snapshot, recommended: recommended.length + cachedJobs.length, ...progress,
-                jobs: snapshot.jobs.map(job => cachedById.get(String(job.id)) || job) });
-            }, isCancelled, async cachedJob => {
-              if (cachedJob.match && shouldAutoDeliver?.() && !autoQueuedIds.has(cachedJob.id)) {
-                // 投递已由全局队列串行控制；不能让发送过程阻塞后续岗位的识别和预览渲染。
-                autoQueuedIds.add(cachedJob.id);
-                void onAutoDeliver?.(cachedJob).catch(error => console.warn('[BOSS 智能投递] 自动投递任务未能启动', error));
-              }
-            }, onLog);
-            const cachedById = new Map(cached.map(job => [job.id, job]));
-            for (let index = startIndex; index < startIndex + screened.length; index += 1) {
-              const job = analyzed[index];
-              const cachedJob = cachedById.get(job.id);
-              if (cachedJob) {
-                analyzed[index] = { ...job, ...cachedJob };
-              } else if (job.match) {
-                // 缓存失败不等于无法投递：批量发送时仍可从当前列表卡片重新读取元数据。
-                const fallbackJob = { ...job, reason: '岗位信息读取不完整，投递时重新读取' };
-                analyzed[index] = fallbackJob;
-                if (shouldAutoDeliver?.() && !autoQueuedIds.has(fallbackJob.id)) {
-                  autoQueuedIds.add(fallbackJob.id);
-                  void onAutoDeliver?.(fallbackJob).catch(error => console.warn('[BOSS 智能投递] 自动投递任务未能启动', error));
-                }
-              }
-            }
-            for (const job of cached) {
-              recommended.push(job);
-              if (recommended.length >= dailyDeliveryLimit) break;
-            }
-          };
           const autoDelivering = Boolean(shouldAutoDeliver?.());
           const screenedRecordsById = new Map();
-          if (reusable.length) await processScreenedJobs(reusable);
+          if (reusable.length) await processScreenedJobs(reusable, listPage);
           const manualStartIndex = analyzed.length;
           const screened = await screenJobsInChunks(settings, pendingScreening, (current, total) => {
             onProgress?.(progressSnapshot({ page: listPage + 1, total, phase: `本页 AI 已完成 ${current}/${total}，已复用历史 ${reusable.length} 个` }));
-          }, isCancelled, autoDelivering ? 1 : SCREENING_CHUNK_SIZE, async screenedChunk => {
-            const mergedChunk = await mergeAndPersistScreenedJobs(screenedChunk);
+          }, isCancelled, autoDelivering ? 1 : SCREENING_CHUNK_SIZE, async (screenedChunk, requestSettings) => {
+            const mergedChunk = await mergeAndPersistScreenedJobs(screenedChunk, requestSettings);
+            aiScreened += mergedChunk.length;
             mergedChunk.forEach(job => screenedRecordsById.set(String(job.id), job));
             if (!autoDelivering) {
               analyzed.push(...mergedChunk);
@@ -1216,12 +1220,15 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
             analyzed.push(...mergedChunk);
             // 每批 AI 结果先进入预览；自动投递必须等待下面的完整职位详情读取完成。
             onProgress?.(progressSnapshot({ page: listPage + 1, phase: '正在读取岗位详情' }));
-            cachePipeline = cachePipeline.then(() => processScreenedJobs(mergedChunk, { alreadyShown: true, startIndex }));
-          }, onLog, autoDelivering ? AUTO_SCREENING_CONCURRENCY : 1);
+            cachePipeline = cachePipeline.then(() => processScreenedJobs(mergedChunk, listPage, { alreadyShown: true, startIndex }));
+          }, onLog, {
+            concurrency: autoDelivering ? AUTO_SCREENING_CONCURRENCY : 1,
+            onChunkFailed: failed => recordFailures(failed),
+          });
           // 手动确认模式在本页筛选完毕后缓存详情；自动模式按批处理。
           if (!autoDelivering) {
             const mergedScreened = screened.map(job => screenedRecordsById.get(String(job.id)) || job);
-            await processScreenedJobs(mergedScreened, { alreadyShown: true, startIndex: manualStartIndex });
+            await processScreenedJobs(mergedScreened, listPage, { alreadyShown: true, startIndex: manualStartIndex });
           }
           else await cachePipeline;
         }
@@ -1251,6 +1258,7 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
         // 当前搜索页可能已经按新提示词重筛并保存了部分历史岗位，跳过这些记录，
         // 防止它们在同一轮里重复请求 AI。
         const pendingRecords = group.records.filter(record => {
+          if (pendingReview.has(String(record.id))) return false;
           const latest = reusableRecords.get(String(record.id)) || record;
           const currentResults = validProfileResults(latest, profiles, settings.screeningVersion);
           return group.profiles.some(profile => !currentResults.has(String(profile.id)));
@@ -1267,30 +1275,45 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
           summary: record.summary || '',
           detailUrl: record.detailUrl || record.jobUrl || '',
         }));
-        try {
-          const targetedSettings = { ...settings, profiles: group.profiles };
-          const mergedById = new Map();
-          await screenJobsInChunks(targetedSettings, jobs, undefined, isCancelled, SCREENING_CHUNK_SIZE, async screenedChunk => {
-            const mergedChunk = screenedChunk.map(job => combineProfileScreeningResult(
-              job,
-              reusableRecords.get(String(job.id)),
-              job.profileMatches,
-              settings,
-              profiles,
-            ));
-            await saveScreeningRecords(mergedChunk, settings.screeningVersion);
-            mergedChunk.forEach(record => {
-              const savedRecord = { ...record, screeningVersion: String(settings.screeningVersion || '') };
-              reusableRecords.set(String(record.id), savedRecord);
-              mergedById.set(String(record.id), savedRecord);
-            });
-          }, onLog);
-          const merged = [...mergedById.values()];
-          const restored = merged.filter(job => job.match).length;
-          onLog?.(`历史排除岗位复筛完成：${restored} 个恢复为符合条件，${merged.length - restored} 个继续排除`);
-        } catch (error) {
-          if (error?.code === 'BQA_DISCOVERY_STOPPED') throw error;
-          onLog?.(`历史排除岗位复筛失败：${error?.message || '未知错误'}；原排除状态已保留`, 'error');
+        const historySettings = { ...settings };
+        const targetedSettings = { ...historySettings, profiles: group.profiles };
+        let restored = 0;
+        let excluded = 0;
+        await screenJobsInChunks(targetedSettings, jobs, undefined, isCancelled, SCREENING_CHUNK_SIZE, async screenedChunk => {
+          const merged = await mergeAndPersistScreenedJobs(screenedChunk, historySettings);
+          restored += merged.filter(job => job.match).length;
+          excluded += merged.filter(job => !job.match).length;
+        }, onLog, { onChunkFailed: failed => recordFailures(failed, group.profiles) });
+        onLog?.(`历史排除岗位复筛：${restored} 个恢复为符合条件，${excluded} 个继续排除，${jobs.length - restored - excluded} 个待复查`);
+      }
+      if (pendingReview.size && !(shouldStopForDailyLimit?.() && dailyDeliveryLimitReached())) {
+        const retryGroups = new Map();
+        for (const { job, historicalProfiles } of pendingReview.values()) {
+          if (screeningRecordWasDelivered(job, delivered) || screeningRecordWasManuallyDismissed(job)
+            || screeningRecordWasCompanyHidden(job)) continue;
+          if (!retryGroups.has(historicalProfiles)) retryGroups.set(historicalProfiles, []);
+          const { screeningError, ...input } = job;
+          retryGroups.get(historicalProfiles).push(input);
+        }
+        for (const [historicalProfiles, jobs] of retryGroups) {
+          throwIfDiscoveryCancelled(isCancelled);
+          if (shouldStopForDailyLimit?.() && dailyDeliveryLimitReached()) break;
+          const retrySettings = { ...settings };
+          const targetProfiles = historicalProfiles
+            ? screeningProfilesFor(retrySettings).filter(profile => historicalProfiles.some(old => old.id === profile.id))
+            : null;
+          if (targetProfiles && !targetProfiles.length) continue;
+          onLog?.(`本轮扫描结束，补查 ${jobs.length} 个待复查岗位`);
+          await screenJobsInChunks(targetProfiles ? { ...retrySettings, profiles: targetProfiles } : retrySettings, jobs, (done, total) => {
+            onProgress?.(progressSnapshot({ phase: `补查本轮岗位 ${done}/${total}` }));
+          }, isCancelled, 1, async (screenedChunk, requestSettings) => {
+            const merged = await mergeAndPersistScreenedJobs(screenedChunk, targetProfiles ? retrySettings : requestSettings);
+            merged.forEach(job => pendingReview.delete(String(job.id)));
+            if (!targetProfiles) {
+              aiScreened += merged.length;
+              await processScreenedJobs(merged, Math.max(0, Number(merged[0]?.listPage) || 0));
+            }
+          }, onLog, { concurrency: AUTO_SCREENING_CONCURRENCY, onChunkFailed: failed => recordFailures(failed, historicalProfiles) });
         }
       }
     } catch (error) {
@@ -1318,8 +1341,10 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
         }
       }
     }
-    onLog?.(`识别流程结束：读取 ${eligible} 个岗位，符合条件 ${analyzed.filter(job => job.match).length} 个，被排除 ${analyzed.filter(job => !job.match).length} 个`);
-    return { jobs: analyzed, eligible, error: collectionError };
+    const summary = progressSnapshot({ phase: pendingReview.size ? `识别结束，${pendingReview.size} 个岗位待复查` : '识别完成' });
+    onLog?.(`本轮小结：读取 ${eligible} 个，历史排除 ${historyExcluded} 个，AI 新筛 ${aiScreened} 个，匹配 ${summary.matched} 个，待复查 ${pendingReview.size} 个`);
+    onProgress?.(summary);
+    return { jobs: analyzed, eligible, reviewPending: pendingReview.size, error: collectionError };
   }
 
   const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -3056,7 +3081,8 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
       const [recognitionLabel, recognitionTone] = recognitionStatus();
       const hiddenExcluded = Math.max(0, state.excluded - allJobs.filter(job => !job.match).length);
       const previewText = hiddenExcluded ? `，弹窗保留最近 ${MAX_LIVE_EXCLUDED_JOBS} 条排除项，另有 ${hiddenExcluded} 条已保存到设置页` : '';
-      summary.innerHTML = `${progressTag(recognitionLabel, recognitionTone)}${scopeText}累计读取 <strong>${totalEligible}</strong> 个，新增 <strong>${totalNew}</strong> / 重复 <strong>${totalRepeated}</strong> 个，已筛选 <strong>${totalScreened}</strong> 个，匹配 <strong>${matchedCount}</strong> 个${limitText}${pageText}${partialErrorText}`;
+      const screeningBreakdown = `。本次搜索历史排除 <strong>${state.historyExcluded || 0}</strong>，AI 新筛 <strong>${state.aiScreened || 0}</strong>，待复查 <strong>${state.reviewPending || 0}</strong>`;
+      summary.innerHTML = `${progressTag(recognitionLabel, recognitionTone)}${scopeText}累计读取 <strong>${totalEligible}</strong> 个，新增 <strong>${totalNew}</strong> / 重复 <strong>${totalRepeated}</strong> 个，已筛选 <strong>${totalScreened}</strong> 个，匹配 <strong>${matchedCount}</strong> 个${screeningBreakdown}${limitText}${pageText}${partialErrorText}`;
       renderDeliveryCounter();
       syncAutoRetryButton();
       deliver.hidden = state.autoDeliver;
@@ -3181,8 +3207,11 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
         state.excluded = Number(progress.excluded ?? Math.max(0, state.screened - state.matched));
         state.pageNew = Number(progress.pageNew || 0);
         state.pageRepeated = Number(progress.pageRepeated || 0);
+        state.historyExcluded = Number(progress.historyExcluded || 0);
+        state.aiScreened = Number(progress.aiScreened || 0);
+        state.reviewPending = Number(progress.reviewPending || 0);
         state.jobs = applyManualRestores(limitReviewJobs(progress.jobs || state.jobs));
-        state.page = progress.page;
+        state.page = progress.page ?? state.page;
         state.phase = progress.phase || '';
         render();
       },
@@ -3201,7 +3230,7 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
           appendLiveLog(`识别结束时存在未完成步骤：${partialError}`, 'error');
         }
         appendLiveLog(`识别已结束：符合条件 ${jobs.filter(job => job.match).length} 个，被排除 ${jobs.filter(job => !job.match).length} 个`);
-        heading.textContent = '这些岗位值得联系';
+        heading.textContent = state.reviewPending ? `识别结束 · ${state.reviewPending} 个待复查` : '这些岗位值得联系';
         heading.classList.remove('bqa-live-review-title');
         const doneStop = stop.cloneNode(true);
         doneStop.textContent = state.limitReached ? '已达上限' : '停止识别';
@@ -3970,6 +3999,7 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
       city: runUrl.searchParams.get('city') || '',
       jobType: runUrl.searchParams.get('jobType') || '',
       eligible: 0, screened: 0, matched: 0, excluded: 0, pageNew: 0, pageRepeated: 0, recommended: 0, page: 0, phase: '准备开始',
+      historyReused: 0, historyExcluded: 0, aiScreened: 0, reviewPending: 0,
     };
     let runStatusTimer = 0;
     const persistRunStatus = (patch = {}, immediate = false) => {
@@ -3977,6 +4007,8 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
       runStatus.phase = String(runStatus.phase || '').replace(settings.apiKey || '\u0000', '[已隐藏 API Key]').replace(/sk-[A-Za-z0-9_-]{12,}/g, '[已隐藏密钥]').slice(0, 100);
       clearTimeout(runStatusTimer);
       const snapshot = { ...runStatus };
+      // 完成状态和小结同次写入，避免顺序搜索提前关闭本页。
+      if (snapshot.status !== 'running') return;
       const save = () => chrome.storage.local.set({ [SEARCH_RUN_STATUS_KEY]: snapshot }, () => {
         if (chrome.runtime.lastError) console.warn('[BOSS 求职加速器] 搜索进度保存失败', chrome.runtime.lastError.message);
       });
@@ -3990,7 +4022,9 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
           eligible: Number(progress.eligible || 0), screened: Number(progress.screened || 0),
           matched: Number(progress.matched || 0), excluded: Number(progress.excluded || 0),
           pageNew: Number(progress.pageNew || 0), pageRepeated: Number(progress.pageRepeated || 0),
-          recommended: Number(progress.recommended || 0), page: Number(progress.page || 0), phase: String(progress.phase || '识别中').slice(0, 100),
+          historyReused: Number(progress.historyReused || 0), historyExcluded: Number(progress.historyExcluded || 0),
+          aiScreened: Number(progress.aiScreened || 0), reviewPending: Number(progress.reviewPending || 0),
+          recommended: Number(progress.recommended || 0), page: Number(progress.page ?? runStatus.page), phase: String(progress.phase || '识别中').slice(0, 100),
         });
         launcher?.querySelector('.bqa-ai-launcher__label')?.setAttribute(
           'data-progress',
@@ -4025,7 +4059,10 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
       // 只等“入队”完成；实际投递由后台队列继续处理，完成后再安全切换城市。
       await Promise.allSettled(pendingEnqueues);
       const jobs = collected.jobs;
-      persistRunStatus({ status: collected.error ? 'partial' : 'completed', phase: collected.error ? '识别中断，已保留已有结果' : '识别完成', finishedAt: Date.now() }, true);
+      const finalStatus = collected.error ? 'partial' : 'completed';
+      const finalPhase = collected.error ? '识别中断，已保留已有结果'
+        : collected.reviewPending ? `识别结束，${collected.reviewPending} 个岗位待复查` : '识别完成';
+      persistRunStatus({ status: finalStatus, phase: finalPhase, finishedAt: Date.now() }, true);
       if (!jobs.length) {
         liveReview.finish(jobs, collected.eligible, { partialError: collected.error?.message || '' });
         return;
@@ -4047,6 +4084,14 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
       liveReview.fail(error);
     } finally {
       if (runStatus.status === 'running') persistRunStatus({ status: 'interrupted', phase: '任务提前结束', finishedAt: Date.now() }, true);
+      try {
+        const saved = await sendBackgroundRequest({ type: 'BQA_SAVE_CITY_SUMMARY', summary: runStatus }, '保存城市搜索小结');
+        if (!saved?.ok) throw new Error(saved?.error || '未能保存城市搜索小结');
+      } catch (error) {
+        liveReview.log(`城市小结保存失败：${error?.message || '后台未返回结果'}`, 'warn');
+        const latest = await readStorage(SEARCH_RUN_STATUS_KEY, null).catch(() => null);
+        if (latest?.runId === runStatus.runId) await setStored(SEARCH_RUN_STATUS_KEY, runStatus).catch(() => {});
+      }
       window.__bqaAiFlowRunning = false;
       if (activeAiFlowSettings === settings) activeAiFlowSettings = null;
       launcher?.classList.remove('is-thinking');
