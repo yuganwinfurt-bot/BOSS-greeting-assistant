@@ -16,6 +16,9 @@
   const HISTORY_PAGE_SIZE = 25;
   const DEFAULT_API_URL = 'https://api.deepseek.com/chat/completions';
   const DEFAULT_MODEL = 'deepseek-flash';
+  const RESUME_SUMMARY_MAX_LENGTH = 800;
+  const DEEPSEEK_EFFORT_LEVELS = ['low', 'high', 'max'];
+  const EFFORT_LEVEL_DISTANCE = 100;
   const DEFAULT_SCREENING_PROMPT = '你是谨慎的求职助手。仅依据求职者简历、多个目标岗位画像与岗位信息判断岗位是否匹配。每个岗位画像必须独立判断；岗位方向明显无关、要求明显超出简历时应判为不匹配。判断理由要具体、简洁，且只能基于已提供的信息。';
   const DEFAULT_GREETING_PROMPT = '你是求职者本人，正在 BOSS 直聘向 HR 发第一句招呼语。内容会原样发送。只能根据简历中真实具备的能力和经历写，严禁虚构。写自然真诚的中文开场白，优先点出与岗位最相关的技能和经历。';
   const CITY_CODES = { 全国: '100010000', 北京: '101010100', 上海: '101020100', 广州: '101280100', 深圳: '101280600', 杭州: '101210100', 成都: '101270100', 武汉: '101200100', 南京: '101190100', 苏州: '101190400', 西安: '101110100', 重庆: '101040100', 天津: '101030100', 长沙: '101250100', 郑州: '101180100', 厦门: '101230200', 青岛: '101120200', 济南: '101120100', 合肥: '101220100', 佛山: '101280800' };
@@ -41,7 +44,7 @@
   function screeningVersionFor(settings) {
     const profiles = Array.isArray(settings?.profiles) ? settings.profiles.map(profile => ({ id: profile.id, name: profile.name, targetProfile: profile.targetProfile, enabled: profile.enabled !== false })) : [];
     const snapshot = JSON.stringify({
-      resumePdfText: screeningConfigValue(settings?.resumePdfText),
+      resumePdfText: screeningConfigValue(settings?.screeningResumeSummary) || screeningConfigValue(settings?.resumePdfText),
       targetProfile: screeningConfigValue(settings?.targetProfile),
       screeningPrompt: screeningConfigValue(settings?.screeningPrompt || DEFAULT_SCREENING_PROMPT),
       profiles,
@@ -250,6 +253,7 @@
   function renderBasic() {
     const renderRevision = configRenderRevision;
     const screeningVersion = settings.screeningVersion || screeningVersionFor(settings);
+    const savedEffort = DEEPSEEK_EFFORT_LEVELS.includes(settings.deepSeekReasoningEffort) ? settings.deepSeekReasoningEffort : 'high';
     $('[data-panel="basic"]').innerHTML = `<section class="script-launch-bar" aria-label="手动搜索入口"><div><strong>手动搜索</strong><span>按纳入顺序搜索的方案逐个搜索各城市岗位</span></div><button type="button" class="button primary" id="run-all-search">立即顺序搜索纳入方案</button></section><form id="basic-form" class="form-grid">
       <div class="settings-column">
         <section class="config-section wide">
@@ -257,8 +261,17 @@
           <div class="config-section__grid">
             <label class="field">API URL<input name="apiUrl" type="url" value="${escapeHtml(settings.apiUrl || DEFAULT_API_URL)}" placeholder="${DEFAULT_API_URL}"></label>
             <label class="field">API Key<input name="apiKey" type="password" value="${escapeHtml(settings.apiKey)}" placeholder="输入你的 API Key"></label>
-            <label class="field">模型名<input name="model" value="${escapeHtml(settings.model || DEFAULT_MODEL)}" placeholder="${DEFAULT_MODEL}"><em class="field-note">V4.1 Flash-1017 的 API 模型名是 deepseek-flash；默认官方接口会使用 max 思考强度。</em></label>
+            <label class="field">模型名<input name="model" value="${escapeHtml(settings.model || DEFAULT_MODEL)}" placeholder="${DEFAULT_MODEL}"></label>
             <div class="api-test-action"><button type="button" class="button" data-test-api>测试 API</button></div>
+            <div class="field wide">
+              <label for="deepseek-effort">推理强度</label> <output class="effort-value" for="deepseek-effort" data-deepseek-effort>${savedEffort.toUpperCase()}</output>
+              <div class="effort-control">
+                <div class="effort-track" aria-hidden="true"><span class="effort-fill"></span><span class="effort-thumb"></span></div>
+                <input id="deepseek-effort" class="effort-input" name="deepSeekEffortLevel" type="range" min="0" max="${(DEEPSEEK_EFFORT_LEVELS.length - 1) * EFFORT_LEVEL_DISTANCE}" step="1" value="${DEEPSEEK_EFFORT_LEVELS.indexOf(savedEffort) * EFFORT_LEVEL_DISTANCE}" aria-valuetext="${savedEffort.toUpperCase()}" aria-describedby="deepseek-effort-help">
+              </div>
+              <div class="effort-scale" aria-hidden="true"><span>Low</span><span>High</span><span>Max</span></div>
+              <span id="deepseek-effort-help" class="field-note">仅对 DeepSeek 官方接口的 deepseek-flash 生效。默认 High，强度越高通常越耗 token。</span>
+            </div>
           </div>
         </section>
         <section class="config-section wide">
@@ -299,6 +312,10 @@
               <input name="resumePdf" type="file" accept="application/pdf,.pdf">
               <div class="resume-pdf-status" data-resume-pdf-status></div>
               <details class="resume-pdf-details" data-resume-pdf-details hidden><summary>查看本机提取的简历文字</summary><pre data-resume-pdf-preview></pre></details>
+              <label class="field">筛选简历摘要<textarea class="short" name="screeningResumeSummary" aria-describedby="resume-summary-length" placeholder="保留学历、毕业时间、实习、项目职责和技术栈。">${escapeHtml(settings.screeningResumeSummary || '')}</textarea></label>
+              <small id="resume-summary-length" class="resume-pdf-help"></small>
+              <button type="button" class="button" data-summarize-screening-resume disabled>用 AI 生成摘要</button>
+              <small class="resume-pdf-help">摘要保存后，所有城市的岗位筛选都只发送摘要。可手填，或用一次 AI 调用生成。留空则使用完整简历。</small>
               <button type="button" class="button primary" data-generate-from-resume disabled>一键根据简历配置岗位</button>
               <small class="resume-pdf-help" data-resume-pdf-help>先填写 AI 接口 URL、Key 和模型，再上传 PDF 简历；生成结果会替换岗位条件和搜索词，城市、薪资、求职类型及投递规则保持不变。</small>
             </div>
@@ -307,7 +324,7 @@
         <section class="config-section wide config-prompts">
           <header class="config-section__header"><span class="config-section__icon" aria-hidden="true">✎</span><div><h3>AI 提示词</h3><p>岗位筛选和 AI 招呼语分别使用下方对应提示词；招呼方式由开关控制。</p></div></header>
           <div class="config-section__grid">
-            <label class="field wide"><span class="field-label"><span>岗位识别提示词</span><em>自动保存后，当前任务下一条岗位生效</em></span><textarea class="short" name="screeningPrompt" placeholder="填写岗位匹配策略…">${escapeHtml(settings.screeningPrompt || DEFAULT_SCREENING_PROMPT)}</textarea><span class="prompt-field-help">停止输入约 0.6 秒后自动保存；正在进行的模型请求不会中途替换，后续岗位使用新提示词。自动注入：PDF 简历、岗位名称与岗位要求、岗位信息；JSON 返回结构由插件固定保护。</span><button type="button" class="prompt-reset" data-reset-prompt="screening">恢复默认</button></label>
+            <label class="field wide"><span class="field-label"><span>岗位识别提示词</span><em>自动保存后，当前任务下一条岗位生效</em></span><textarea class="short" name="screeningPrompt" placeholder="填写岗位匹配策略…">${escapeHtml(settings.screeningPrompt || DEFAULT_SCREENING_PROMPT)}</textarea><span class="prompt-field-help">停止输入约 0.6 秒后自动保存，后续岗位使用新提示词。筛选时附带简历摘要（留空时用 PDF 全文）、岗位要求和岗位信息。</span><button type="button" class="prompt-reset" data-reset-prompt="screening">恢复默认</button></label>
             <label class="field wide"><span class="field-label"><span>打招呼话术提示词</span><em>控制开场白语气、重点和长度</em></span><textarea class="short" name="greetingPrompt" placeholder="填写话术生成策略…">${escapeHtml(settings.greetingPrompt || DEFAULT_GREETING_PROMPT)}</textarea><span class="prompt-field-help">自动注入：PDF 简历、岗位 JD 和匹配方向；最终只发送纯文本招呼语。</span><button type="button" class="prompt-reset" data-reset-prompt="greeting">恢复默认</button></label>
           </div>
           <div class="prompt-toggle-row"><div><strong>AI 招呼语开关</strong><small>开启后使用上方“打招呼话术提示词”生成并发送招呼语；关闭后，插件点击 BOSS“立即沟通”，招呼语由 BOSS 自动招呼设置决定。岗位筛选仍使用上方自定义规则。</small></div><label class="switch prompt-toggle"><input type="checkbox" name="aiGreetingEnabled" aria-label="启用 AI 招呼语" ${settings.aiGreetingEnabled !== false ? 'checked' : ''}><i></i></label></div>
@@ -316,6 +333,56 @@
       </div>
       </form>`;
     const form = $('#basic-form');
+    const effortSlider = form.elements.namedItem('deepSeekEffortLevel');
+    const effortControl = effortSlider.closest('.effort-control');
+    const effortValue = form.querySelector('[data-deepseek-effort]');
+    const lastEffortIndex = DEEPSEEK_EFFORT_LEVELS.length - 1;
+    let savedEffortIndex = DEEPSEEK_EFFORT_LEVELS.indexOf(savedEffort);
+    const readEffort = () => DEEPSEEK_EFFORT_LEVELS[savedEffortIndex];
+    const renderEffort = () => {
+      const position = effortSlider.valueAsNumber;
+      effortControl.style.setProperty('--effort-progress', `${100 * position / Number(effortSlider.max)}%`);
+      const label = DEEPSEEK_EFFORT_LEVELS[Math.round(position / EFFORT_LEVEL_DISTANCE)].toUpperCase();
+      if (effortValue.value === label) return;
+      effortValue.value = label;
+      effortSlider.setAttribute('aria-valuetext', label);
+    };
+    const commitEffort = index => {
+      const next = Math.max(0, Math.min(lastEffortIndex, index));
+      effortSlider.valueAsNumber = next * EFFORT_LEVEL_DISTANCE;
+      renderEffort();
+      if (savedEffortIndex === next) return;
+      savedEffortIndex = next;
+      scheduleAutoSave(true);
+    };
+    renderEffort();
+    effortSlider.addEventListener('input', renderEffort);
+    effortSlider.addEventListener('change', () => commitEffort(Math.round(effortSlider.valueAsNumber / EFFORT_LEVEL_DISTANCE)));
+    effortSlider.addEventListener('keydown', event => {
+      let next;
+      switch (event.key) {
+        case 'ArrowLeft':
+        case 'ArrowDown':
+        case 'PageDown':
+          next = savedEffortIndex - 1;
+          break;
+        case 'ArrowRight':
+        case 'ArrowUp':
+        case 'PageUp':
+          next = savedEffortIndex + 1;
+          break;
+        case 'Home':
+          next = 0;
+          break;
+        case 'End':
+          next = lastEffortIndex;
+          break;
+        default:
+          return;
+      }
+      event.preventDefault();
+      commitEffort(next);
+    });
     let profiles = normalizeProfiles(settings.profiles, settings);
     const profileList = form.querySelector('[data-profile-list]');
     const readProfileCards = () => [...profileList.querySelectorAll('.profile-editor')].map((card, index) => {
@@ -350,6 +417,16 @@
     const pdfDetails = form.querySelector('[data-resume-pdf-details]');
     const pdfTextPreview = form.querySelector('[data-resume-pdf-preview]');
     const pdfHelp = form.querySelector('[data-resume-pdf-help]');
+    const resumeSummaryField = form.elements.namedItem('screeningResumeSummary');
+    const resumeSummaryLength = form.querySelector('#resume-summary-length');
+    const readResumeSummary = () => resumeSummaryField.value.trim();
+    const updateResumeSummaryLength = () => {
+      const length = readResumeSummary().length;
+      resumeSummaryLength.textContent = length > RESUME_SUMMARY_MAX_LENGTH
+        ? `${length} / ${RESUME_SUMMARY_MAX_LENGTH} 字符 · 草稿未生效，缩短后自动保存。`
+        : `${length} / ${RESUME_SUMMARY_MAX_LENGTH} 字符`;
+    };
+    const summarizeResumeButton = form.querySelector('[data-summarize-screening-resume]');
     const generateFromResumeButton = form.querySelector('[data-generate-from-resume]');
     const importFile = form.querySelector('[data-import-config-file]');
     form.querySelector('[data-export-config]').addEventListener('click', exportConfig);
@@ -373,11 +450,15 @@
       const previousSearchTerms = [...new Set(searchConditions.map(item => String(item.keyword || '').trim()).filter(Boolean))].sort();
       const nextProfiles = readProfileCards();
       const nextSearchTerms = profileSearchTerms(nextProfiles).sort();
+      const summary = readResumeSummary();
+      const previousSummary = pendingResumePdfText === settings.resumePdfText ? settings.screeningResumeSummary || '' : '';
       await saveSettings({
         apiUrl: data.get('apiUrl').trim(),
         apiKey: data.get('apiKey').trim(),
         model: data.get('model').trim(),
+        deepSeekReasoningEffort: readEffort(),
         resumePdfText: pendingResumePdfText,
+        screeningResumeSummary: summary.length <= RESUME_SUMMARY_MAX_LENGTH ? summary : previousSummary,
         resumePdfName: pendingResumePdfName,
         resumePdfPages: pendingResumePdfPages,
         screeningPrompt: data.get('screeningPrompt').trim() || DEFAULT_SCREENING_PROMPT,
@@ -429,11 +510,13 @@
         pdfDetails.hidden = true;
         pdfTextPreview.textContent = '';
       }
+      updateResumeSummaryLength();
       updateAgentGate();
     };
     const updateAgentGate = () => {
       const agentReady = Boolean(form.apiUrl.value.trim() && form.apiKey.value.trim() && form.model.value.trim());
       generateFromResumeButton.disabled = !agentReady || !pendingResumePdfText || generateFromResumeButton.dataset.busy === 'true';
+      summarizeResumeButton.disabled = !agentReady || !pendingResumePdfText || Boolean(resumeSummaryField.value.trim()) || summarizeResumeButton.dataset.busy === 'true';
       if (!agentReady) pdfHelp.textContent = '先在上方 AI 接口填写 API URL、API Key 和模型，再使用此功能。';
       else if (!pendingResumePdfText) pdfHelp.textContent = '上传可复制文字的 PDF 简历后，即可一键生成岗位条件。扫描件暂不支持 OCR。';
       else pdfHelp.textContent = '生成结果会替换岗位条件和搜索词；城市、薪资、求职类型及投递规则保持不变。';
@@ -483,6 +566,7 @@
       pdfStatus.textContent = '正在本机读取 PDF…';
       try {
         const extracted = await readPdfLocally(file);
+        if (pendingResumePdfText !== extracted.text) resumeSummaryField.value = '';
         pendingResumePdfText = extracted.text;
         pendingResumePdfName = file.name;
         pendingResumePdfPages = extracted.pages;
@@ -500,12 +584,56 @@
       pendingResumePdfText = '';
       pendingResumePdfName = '';
       pendingResumePdfPages = 0;
+      resumeSummaryField.value = '';
       updateResumePdfUi();
       scheduleAutoSave(true);
     });
     form.querySelectorAll('[name="apiUrl"], [name="apiKey"], [name="model"]').forEach(input => {
       input.addEventListener('input', updateAgentGate);
       input.addEventListener('change', updateAgentGate);
+    });
+    resumeSummaryField.addEventListener('input', () => {
+      updateResumeSummaryLength();
+      updateAgentGate();
+    });
+    summarizeResumeButton.addEventListener('click', async () => {
+      if (summarizeResumeButton.disabled) return;
+      const sourceText = pendingResumePdfText;
+      summarizeResumeButton.dataset.busy = 'true';
+      summarizeResumeButton.textContent = 'AI 正在生成摘要…';
+      updateAgentGate();
+      try {
+        const response = await chrome.runtime.sendMessage({
+          type: 'BQA_SUMMARIZE_SCREENING_RESUME',
+          settings: {
+            apiUrl: form.apiUrl.value.trim(),
+            apiKey: form.apiKey.value.trim(),
+            model: form.model.value.trim(),
+            deepSeekReasoningEffort: readEffort(),
+            resumePdfText: sourceText,
+          },
+        });
+        if (renderRevision !== configRenderRevision) return;
+        if (!response) throw new Error('扩展后台未响应摘要请求。请到 edge://extensions 重新加载扩展，再刷新此页。');
+        if (!response.ok) throw new Error(response.error || '生成摘要失败，请查看运行诊断日志。');
+        if (typeof response.summary !== 'string' || !response.summary.trim()) throw new Error('扩展后台返回了空摘要，请重新生成。');
+        if (pendingResumePdfText !== sourceText || readResumeSummary()) return;
+        resumeSummaryField.value = response.summary.trim();
+        updateResumeSummaryLength();
+        if (readResumeSummary().length > RESUME_SUMMARY_MAX_LENGTH) {
+          resumeSummaryField.focus();
+          notice(`已保留 AI 摘要草稿，缩短到 ${RESUME_SUMMARY_MAX_LENGTH} 字符以内后会自动保存。`);
+          return;
+        }
+        await flushBasicSave();
+        notice('筛选简历摘要已保存，可以在上方编辑。');
+      } catch (error) {
+        notice(error.message || '生成筛选简历摘要失败。', 'error');
+      } finally {
+        summarizeResumeButton.dataset.busy = 'false';
+        summarizeResumeButton.textContent = '用 AI 生成摘要';
+        updateAgentGate();
+      }
     });
     generateFromResumeButton.addEventListener('click', async () => {
       if (generateFromResumeButton.disabled) return;
@@ -521,7 +649,7 @@
         const preferences = groupSearchConditions(searchConditions).map(item => ({ cities: item.cities, jobType: item.jobType, salary: item.salary }));
         const response = await chrome.runtime.sendMessage({
           type: 'BQA_CONFIGURE_FROM_RESUME',
-          settings: { ...agent, resumePdfText: pendingResumePdfText, profiles: currentProfiles },
+          settings: { ...agent, deepSeekReasoningEffort: readEffort(), resumePdfText: pendingResumePdfText, profiles: currentProfiles },
           preferences,
         });
         if (!response) throw new Error('扩展后台没有返回 AI 结果。请到 edge://extensions 重新加载本扩展，刷新设置页后重试。');
@@ -554,8 +682,11 @@
       } catch (error) { notice(`API 连接失败：${error.message || '未知错误'}`, 'error'); }
       finally { button.disabled = false; button.textContent = '测试 API'; }
     });
-    form.addEventListener('input', event => { if (event.target.name !== 'resumePdf' && !event.target.closest('[data-search-tasks]')) scheduleAutoSave(); });
-    form.addEventListener('change', event => { if (event.target.name !== 'resumePdf' && !event.target.closest('[data-search-tasks]')) scheduleAutoSave(true); });
+    const shouldAutoSaveField = field => field !== effortSlider && field.name !== 'resumePdf'
+      && (field !== resumeSummaryField || readResumeSummary().length <= RESUME_SUMMARY_MAX_LENGTH)
+      && !field.closest('[data-search-tasks]');
+    form.addEventListener('input', event => { if (shouldAutoSaveField(event.target)) scheduleAutoSave(); });
+    form.addEventListener('change', event => { if (shouldAutoSaveField(event.target)) scheduleAutoSave(true); });
     form.addEventListener('submit', event => { event.preventDefault(); scheduleAutoSave(true); });
   }
 
@@ -638,6 +769,7 @@
     const imported = payload.settings;
     if (!imported || typeof imported !== 'object' || Array.isArray(imported)) throw new Error('配置文件中没有有效的配置内容。');
     if (imported.apiUrl !== undefined && typeof imported.apiUrl !== 'string') throw new Error('配置文件中的 API URL 格式不正确。');
+    if (imported.screeningResumeSummary !== undefined && (typeof imported.screeningResumeSummary !== 'string' || imported.screeningResumeSummary.trim().length > RESUME_SUMMARY_MAX_LENGTH)) throw new Error(`配置文件中的筛选简历摘要格式不正确或超过 ${RESUME_SUMMARY_MAX_LENGTH} 字符。`);
     if (imported.autoSearch !== undefined && (typeof imported.autoSearch !== 'object' || Array.isArray(imported.autoSearch))) throw new Error('配置文件中的搜索方案格式不正确。');
     const next = { ...imported };
     delete next.resumeImage;

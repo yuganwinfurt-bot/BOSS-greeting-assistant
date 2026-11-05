@@ -30,6 +30,7 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
   const MAX_LIVE_EXCLUDED_JOBS = 150;
   // 每批最多判断 3 个岗位，减少重复发送简历和等待模型响应的次数。
   const SCREENING_CHUNK_SIZE = 3;
+  const AUTO_SCREENING_CHUNK_SIZE = 2;
   const AUTO_SCREENING_CONCURRENCY = 2;
   const SCREENING_REPLY_TIMEOUT_MS = 35 * 1000;
   const TIMEOUT_MS = 8000;
@@ -96,7 +97,7 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
   const screeningConfigValue = value => String(value ?? '').trim();
   function screeningVersionFor(settings) {
     const snapshot = JSON.stringify({
-      resumePdfText: screeningConfigValue(settings?.resumePdfText),
+      resumePdfText: screeningConfigValue(settings?.screeningResumeSummary) || screeningConfigValue(settings?.resumePdfText),
       targetProfile: screeningConfigValue(settings?.targetProfile),
       screeningPrompt: screeningConfigValue(settings?.screeningPrompt || DEFAULT_SCREENING_PROMPT),
       profiles: Array.isArray(settings?.profiles) ? settings.profiles.map(profile => ({ id: profile.id, name: profile.name, targetProfile: profile.targetProfile, enabled: profile.enabled !== false })) : [],
@@ -891,7 +892,7 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
         if (!isCancelled?.()) onLog?.(`AI 筛选第 ${batch} 批失败，已记为待复查：${reason}`, 'error');
         return {
           completed: [], failed: chunk.map(job => ({ ...job, screeningError: reason, screeningAttemptStartedAt: startedAt })), requestSettings,
-          fatal: /HTTP\s+(400|401|403|404|429)\b|没有启用的岗位条件/.test(reason) ? error : null,
+          fatal: /HTTP\s+(400|401|402|403|404|422|429)\b|没有启用的岗位条件/.test(reason) ? error : null,
         };
       } finally {
         clearTimeout(replyTimer);
@@ -1207,7 +1208,7 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
           const manualStartIndex = analyzed.length;
           const screened = await screenJobsInChunks(settings, pendingScreening, (current, total) => {
             onProgress?.(progressSnapshot({ page: listPage + 1, total, phase: `本页 AI 已完成 ${current}/${total}，已复用历史 ${reusable.length} 个` }));
-          }, isCancelled, autoDelivering ? 1 : SCREENING_CHUNK_SIZE, async (screenedChunk, requestSettings) => {
+          }, isCancelled, autoDelivering ? AUTO_SCREENING_CHUNK_SIZE : SCREENING_CHUNK_SIZE, async (screenedChunk, requestSettings) => {
             const mergedChunk = await mergeAndPersistScreenedJobs(screenedChunk, requestSettings);
             aiScreened += mergedChunk.length;
             mergedChunk.forEach(job => screenedRecordsById.set(String(job.id), job));
@@ -4285,6 +4286,7 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
         const updated = {
           ...activeAiFlowSettings,
           resumePdfText: saved.resumePdfText ?? activeAiFlowSettings.resumePdfText,
+          screeningResumeSummary: saved.screeningResumeSummary || '',
           targetProfile: saved.targetProfile ?? activeAiFlowSettings.targetProfile,
           screeningPrompt: saved.screeningPrompt || DEFAULT_SCREENING_PROMPT,
           profiles: Array.isArray(saved.profiles) ? saved.profiles.map(profile => ({ ...profile })) : activeAiFlowSettings.profiles,

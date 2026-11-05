@@ -73,6 +73,20 @@ button, input, select, textarea { font: inherit; }
 .button.primary { background: #08a39c; border-color: #08a39c; color: #fff; }
 .button:disabled { cursor: not-allowed; opacity: .55; }
 .api-test-action { align-self: end; display: flex; padding-bottom: 1px; }
+.effort-value { background: #e2f3ef; border-radius: 99px; color: #076a6a; display: inline-block; font-size: 11px; min-width: 43px; padding: 2px 8px; text-align: center; }
+.effort-control { --effort-thumb-size: 20px; --effort-progress: 50%; height: 34px; margin-top: 3px; position: relative; }
+.effort-track { background: #d9e5e2; border-radius: 99px; height: 7px; inset-inline: calc(var(--effort-thumb-size) / 2); pointer-events: none; position: absolute; top: 50%; transform: translateY(-50%); }
+.effort-fill { background: #078f91; border-radius: inherit; display: block; height: 100%; width: var(--effort-progress); transition: width 160ms ease-out; }
+.effort-thumb { background: #078f91; border: 2px solid #fff; border-radius: 50%; box-shadow: 0 1px 5px #06444040; height: var(--effort-thumb-size); left: var(--effort-progress); position: absolute; top: 50%; transform: translate(-50%, -50%); transition: left 160ms ease-out; width: var(--effort-thumb-size); }
+.field .effort-input { appearance: none; border: 0; cursor: ew-resize; height: 100%; inset: 0; margin: 0; opacity: 0; padding: 0; position: absolute; touch-action: pan-y; }
+.effort-input::-webkit-slider-runnable-track { height: var(--effort-thumb-size); }
+.effort-input::-webkit-slider-thumb { appearance: none; height: var(--effort-thumb-size); width: var(--effort-thumb-size); }
+.effort-control:has(.effort-input:active) :is(.effort-fill, .effort-thumb) { transition: none; }
+.effort-control:has(.effort-input:focus-visible) .effort-thumb { outline: 2px solid #076a6a; outline-offset: 3px; }
+.effort-scale { color: #58736d; display: grid; font-size: 11px; font-weight: 500; grid-template-columns: repeat(3, 1fr); }
+.effort-scale > :nth-child(2) { text-align: center; }
+.effort-scale > :last-child { text-align: right; }
+@media (prefers-reduced-motion: reduce) { .effort-fill, .effort-thumb { transition: none; } }
 .field-note { color: #83938e; display: block; font-size: 11px; font-weight: 400; line-height: 1.45; margin-top: 7px; }
 .resume-pdf-field { align-items: start; background: #f7fbf9; border: 1px solid #dce8e3; border-radius: 10px; display: grid; gap: 11px; padding: 14px; }
 .resume-pdf-field > span { color: #31514d; font-size: 13px; font-weight: 700; }
