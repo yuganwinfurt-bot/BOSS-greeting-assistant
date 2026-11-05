@@ -11,6 +11,7 @@ const DEFAULT_GREETING_PROMPT = '你是求职者本人，正在 BOSS 直聘向 H
 // 必须在固定时间内结束。
 const AI_RESPONSE_TIMEOUT_MS = 30 * 1000;
 const AI_STREAM_IDLE_TIMEOUT_MS = 30 * 1000;
+const SCREENING_DEADLINE_MS = 30 * 1000;
 const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 const DIAGNOSTIC_LOGS_KEY = 'bqa-ai-diagnostic-logs';
 const MAX_DIAGNOSTIC_LOGS = 500;
@@ -102,9 +103,10 @@ async function getDeliveryDiagnostics({ recordSnapshot = false } = {}) {
 
 async function fetchWithTimeout(url, options, timeout = AI_RESPONSE_TIMEOUT_MS) {
   const controller = new AbortController();
+  const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    return await fetch(url, { ...options, signal });
   } catch (error) {
     if (controller.signal.aborted) throw new Error(`浏览器到 AI API 的连接等待超时（${Math.round(timeout / 1000)} 秒）`);
     throw error;
@@ -193,7 +195,7 @@ function assistantContentFromResponse(data) {
   );
 }
 
-async function callDeepSeek(payload, actionName) {
+async function callDeepSeek(payload, actionName, { signal, maxRetries = MAX_API_RETRIES } = {}) {
   const endpoint = normalizeEndpoint(payload.apiUrl);
   let lastError;
   const request = async (stream, attempt) => {
@@ -226,7 +228,8 @@ async function callDeepSeek(payload, actionName) {
     const response = await fetchWithTimeout(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${payload.apiKey}` },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      signal,
     });
     if (!response.ok) {
       const detail = (await response.text().catch(() => '')).slice(0, 180);
@@ -259,14 +262,15 @@ async function callDeepSeek(payload, actionName) {
     return result;
   };
   // 首次调用失败后最多再尝试 5 次。两个 AI 能力（筛选、话术）共用该兜底逻辑。
-  for (let retry = 0; retry <= MAX_API_RETRIES; retry += 1) {
+  for (let retry = 0; retry <= maxRetries; retry += 1) {
     try {
+      signal?.throwIfAborted();
       try {
         return await request(true, retry);
       } catch (streamError) {
         // 个别兼容 OpenAI 网关能完成普通请求，却会在 SSE 转发时断流或不输出内容。
         // 同一次尝试中降级为普通响应，避免把“流式兼容问题”误判成模型不可用。
-        if (!/流式响应|event-stream|未返回内容/i.test(String(streamError?.message || ''))) throw streamError;
+        if (signal?.aborted || !/流式响应|event-stream|未返回内容/i.test(String(streamError?.message || ''))) throw streamError;
         try {
           return await request(false, retry);
         } catch (fallbackError) {
@@ -274,14 +278,15 @@ async function callDeepSeek(payload, actionName) {
         }
       }
     } catch (error) {
+      if (signal?.aborted) throw new Error('AI 筛选超过 30 秒，已停止等待本批结果');
       lastError = error;
-      if (retry >= MAX_API_RETRIES) break;
+      if (retry >= maxRetries) break;
       // 递增等待，避免在 API 繁忙或临时断网时连续高频请求。
       await wait(800 * (retry + 1));
     }
   }
   const detail = lastError?.message || '未知错误';
-  throw new Error(`${actionName}失败（已重试 ${MAX_API_RETRIES} 次）：${detail}`);
+  throw new Error(`${actionName}失败（已重试 ${maxRetries} 次）：${detail}`);
 }
 
 async function testAiConnection(settings) {
@@ -1192,7 +1197,7 @@ function abortAutoSearchBatch(batchId) {
   return mutateSearchSequence(batch => batch?.id === batchId ? { batch: null, value: { ok: true } } : { value: { ok: true, stale: true } });
 }
 
-async function screenJobs(settings, jobs) {
+async function screenJobs(settings, jobs, signal = AbortSignal.timeout(SCREENING_DEADLINE_MS)) {
   const profiles = screeningProfiles(settings);
   const profilePrompt = JSON.stringify(profiles.map(profile => ({ id: profile.id, name: profile.name, targetProfile: profile.targetProfile || '未填写' })));
   const data = await callDeepSeek({
@@ -1201,7 +1206,7 @@ async function screenJobs(settings, jobs) {
     body: {
       model: settings.model,
       temperature: 0.2,
-      max_tokens: Math.max(1600, 640 + profiles.length * 420),
+      max_tokens: Math.max(1600, 640 + jobs.length * profiles.length * 420),
       messages: [
         {
           role: 'system',
@@ -1217,34 +1222,45 @@ async function screenJobs(settings, jobs) {
         }
       ]
     }
-  }, '岗位筛选');
+  }, '岗位筛选', { signal, maxRetries: 1 });
   const raw = assistantContentFromResponse(data);
   let list;
   try {
     list = parseScreeningResult(raw);
   } catch (error) {
-    await recordAiDiagnostic({ action: '岗位筛选', phase: 'parse-error', model: settings.model, endpoint: diagnosticEndpoint(settings.apiUrl), jobIds: jobs.map(job => job.id), profileIds: profiles.map(profile => profile.id), rawLength: raw.length, rawPreview: diagnosticPreview(raw), error: error.message });
-    throw error;
+    void recordAiDiagnostic({ action: '岗位筛选', phase: 'parse-error', model: settings.model, endpoint: diagnosticEndpoint(settings.apiUrl), jobIds: jobs.map(job => job.id), profileIds: profiles.map(profile => profile.id), rawLength: raw.length, rawPreview: diagnosticPreview(raw), error: error.message });
+    if (jobs.length <= 1) throw error;
+    list = [];
   }
   const result = new Map(list.map(item => [String(item.id), item]));
-  return jobs.map(job => {
-    const item = result.get(String(job.id)) || {};
-    const evaluations = (Array.isArray(item.evaluations) ? item.evaluations : []).map(evaluation => {
-      const profile = profiles.find(candidate => String(candidate.id) === String(evaluation.profileId));
+  const screened = [];
+  for (const job of jobs) {
+    const item = result.get(String(job.id));
+    const evaluations = (Array.isArray(item?.evaluations) ? item.evaluations : []).map(evaluation => {
+      const profile = profiles.find(candidate => String(candidate.id) === String(evaluation?.profileId));
       return profile ? { ...evaluation, profileId: profile.id, profileName: profile.name } : null;
     }).filter(Boolean);
+    // 批量回答有漏项时，只重问受影响的岗位，避免把批量漏答当作排除结果。
+    if (jobs.length > 1 && (!item || profiles.some(profile => !evaluations.some(evaluation =>
+      evaluation.profileId === profile.id && typeof evaluation.match === 'boolean'
+    )))) {
+      const [retried] = await screenJobs(settings, [job], signal);
+      screened.push(retried);
+      continue;
+    }
     const normalizedEvaluations = profiles.map(profile => evaluations.find(evaluation => String(evaluation.profileId) === String(profile.id)) || { profileId: profile.id, profileName: profile.name, match: false, reason: 'AI 未返回判断' });
     const matches = normalizedEvaluations.filter(item => item.match);
     const best = matches[0] || normalizedEvaluations[0] || {};
-    return {
+    screened.push({
       ...job,
       match: matches.length > 0,
       reason: matches.map(item => `${item.profileName || '岗位'}：${item.reason || '匹配'}`).join('；') || best.reason || 'AI 未返回判断',
       profileMatches: normalizedEvaluations.map(item => ({ profileId: item.profileId, profileName: item.profileName, profileVersion: profiles.find(profile => profile.id === item.profileId)?.version || '', match: Boolean(item.match), reason: item.reason || '' })),
       matchedProfiles: matches.map(item => ({ id: item.profileId, name: item.profileName, version: profiles.find(profile => profile.id === item.profileId)?.version || '' })),
       bestProfile: profiles.find(profile => profile.id === (matches[0]?.profileId || best.profileId)) || profiles[0],
-    };
-  });
+    });
+  }
+  return screened;
 }
 
 function parseScreeningResult(raw) {

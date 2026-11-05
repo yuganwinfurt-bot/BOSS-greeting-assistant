@@ -28,9 +28,10 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
   const DEFAULT_MODEL = 'deepseek-flash';
   const DEFAULT_SCREENING_PROMPT = '你是谨慎的求职助手。仅依据求职者简历、多个目标岗位画像与岗位信息判断岗位是否匹配。每个岗位画像必须独立判断；岗位方向明显无关、要求明显超出简历时应判为不匹配。判断理由要具体、简洁，且只能基于已提供的信息。';
   const MAX_LIVE_EXCLUDED_JOBS = 150;
-  // 人工确认模式每批判断 3 个岗位，减少逐个请求的等待；自动投递仍逐个判断，便于尽早入队。
+  // 每批最多判断 3 个岗位，减少重复发送简历和等待模型响应的次数。
   const SCREENING_CHUNK_SIZE = 3;
-  const AUTO_SCREENING_CHUNK_SIZE = 1;
+  const AUTO_SCREENING_CONCURRENCY = 2;
+  const SCREENING_REPLY_TIMEOUT_MS = 35 * 1000;
   const TIMEOUT_MS = 8000;
   const POLL_MS = 50;
   const CITY_CODES = {
@@ -779,11 +780,11 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
     return '';
   }
 
-  function readJob(card) {
+  function readJob(card, id = jobId(card)) {
     const title = normalize(card.querySelector('[class*="job-name"]')?.innerText) || '未知岗位';
     const salary = salaryText(card);
     return {
-      id: jobId(card), title, company: companyName(card), detailUrl: jobDetailUrl(card),
+      id, title, company: companyName(card), detailUrl: jobDetailUrl(card),
       securityId: securityIdFrom(card),
       salary,
       // BOSS 使用专用字体显示薪资数字；预览中复用该字体，才能正确显示编码后的文本。
@@ -881,12 +882,10 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
     return false;
   }
 
-  async function screenJobsInChunks(settings, jobs, onProgress, isCancelled, chunkSize = SCREENING_CHUNK_SIZE, onChunkScreened, onLog) {
+  async function screenJobsInChunks(settings, jobs, onProgress, isCancelled, chunkSize = SCREENING_CHUNK_SIZE, onChunkScreened, onLog, concurrency = 1) {
     const result = [];
-    for (let start = 0; start < jobs.length; start += chunkSize) {
-      throwIfDiscoveryCancelled(isCancelled);
+    const requestChunk = async (start) => {
       const chunk = jobs.slice(start, start + chunkSize);
-      onProgress?.(Math.min(start + chunk.length, jobs.length), jobs.length);
       const batch = Math.floor(start / chunkSize) + 1;
       // 设置页可能在这一轮扫描期间更新提示词。每个岗位请求使用发送前的快照，
       // 这样后续请求能拿到新提示词，正在进行的请求仍按旧版本保存结果。
@@ -899,22 +898,48 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
       const waitingTimer = setInterval(() => {
         onLog?.(`AI 正在分析第 ${batch} 批，已等待 ${Math.floor((Date.now() - startedAt) / 1000)} 秒`);
       }, 10000);
+      let replyTimer;
       try {
-        const response = await sendBackgroundRequest({ type: 'BQA_SCREEN_JOBS', settings: requestSettings, jobs: chunk }, '岗位筛选');
-        // 网络请求无法从 content script 中途撤回，但返回后不再处理其结果。
-        throwIfDiscoveryCancelled(isCancelled);
+        const response = await Promise.race([
+          sendBackgroundRequest({ type: 'BQA_SCREEN_JOBS', settings: requestSettings, jobs: chunk }, '岗位筛选', 1),
+          new Promise((_, reject) => {
+            replyTimer = setTimeout(() => reject(new Error('扩展后台在 35 秒内未返回筛选结果')), SCREENING_REPLY_TIMEOUT_MS);
+          }),
+        ]);
         if (!response?.ok) throw new Error(response?.error || 'AI 筛选未完成');
-        result.push(...response.jobs);
         const matched = response.jobs.filter(job => job.match).length;
         onLog?.(`AI 筛选第 ${batch} 批完成：匹配 ${matched} 个，排除 ${response.jobs.length - matched} 个，耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)} 秒`);
-        // 自动投递需要在单个岗位完成 AI 判断后立刻进入下一步，不能等同页全部筛选完成。
-        await onChunkScreened?.(response.jobs);
+        return { jobs: response.jobs };
       } catch (error) {
-        if (error?.code !== 'BQA_DISCOVERY_STOPPED') onLog?.(`AI 筛选第 ${batch} 批失败：${error?.message || '未知错误'}`, 'error');
-        throw error;
+        if (!isCancelled?.()) onLog?.(`AI 筛选第 ${batch} 批失败：${error?.message || '未知错误'}`, 'error');
+        return { error };
       } finally {
+        clearTimeout(replyTimer);
         clearInterval(waitingTimer);
       }
+    };
+    const windowSize = chunkSize * concurrency;
+    if (jobs.length) onProgress?.(0, jobs.length);
+    for (let start = 0; start < jobs.length; start += windowSize) {
+      throwIfDiscoveryCancelled(isCancelled);
+      const pending = [];
+      for (let index = start; index < Math.min(start + windowSize, jobs.length); index += chunkSize) {
+        pending.push(requestChunk(index));
+      }
+      let firstError;
+      // 按列表顺序保存和入队，避免模型回复先后改变投递顺序。
+      for (const request of pending) {
+        const outcome = await request;
+        throwIfDiscoveryCancelled(isCancelled);
+        if (outcome.error) {
+          firstError ||= outcome.error;
+          continue;
+        }
+        await onChunkScreened?.(outcome.jobs);
+        result.push(...outcome.jobs);
+        onProgress?.(result.length, jobs.length);
+      }
+      if (firstError) throw firstError;
     }
     return result;
   }
@@ -998,6 +1023,7 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
     const autoQueuedIds = new Set();
     const storedRecords = await readStorage(SCREENING_RECORDS_KEY, []);
     const profiles = screeningProfilesFor(settings);
+    const skipHistoricalAiExclusions = settings.skipHistoricalAiExclusions === true;
     const reusableRecords = new Map((Array.isArray(storedRecords) ? storedRecords : [])
       .filter(record => record?.id)
       .map(record => [String(record.id), record]));
@@ -1026,10 +1052,7 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
       // 必须复筛该画像下旧版本排除的记录，不能让旧判断覆盖新规则。
       const historicalGroups = new Map();
       for (const record of reusableRecords.values()) {
-        if (record.match !== false || record.manualOverride
-          || screeningRecordWasDelivered(record, delivered)
-          || screeningRecordWasManuallyDismissed(record)
-          || screeningRecordWasCompanyHidden(record)) continue;
+        if (record.match !== false || record.manualOverride) continue;
         const currentResults = validProfileResults(record, profiles, settings.screeningVersion);
         const storedProfileResults = Array.isArray(record.profileMatches) ? record.profileMatches : [];
         const hasLegacyVersionChange = !storedProfileResults.length
@@ -1038,13 +1061,16 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
           const profileId = String(profile.id);
           if (currentResults.has(profileId)) return false;
           const previousResult = storedProfileResults.find(result => String(result?.profileId) === profileId);
+          if (skipHistoricalAiExclusions) return !previousResult && profileCategoryMatchesRecord(record, profile);
           const profileVersionChanged = Boolean(previousResult)
             && String(previousResult.profileVersion || '') !== String(profile.version || '');
           return profileVersionChanged
             || hasLegacyVersionChange
             || profileCategoryMatchesRecord(record, profile);
         });
-        if (!relevantProfiles.length) continue;
+        if (!relevantProfiles.length || screeningRecordWasDelivered(record, delivered)
+          || screeningRecordWasManuallyDismissed(record)
+          || screeningRecordWasCompanyHidden(record)) continue;
         const key = relevantProfiles.map(profile => `${profile.id}:${profile.version}`).sort().join('|');
         if (!historicalGroups.has(key)) historicalGroups.set(key, { profiles: relevantProfiles, records: [] });
         historicalGroups.get(key).records.push(record);
@@ -1060,14 +1086,14 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
         // 总数按本轮从 BOSS 列表读取到的全部岗位统计，不受本插件的任何筛选规则影响。
         const cardsOnPage = jobCards();
         const identifiedPageJobs = cardsOnPage
-          .map(card => ({ card, job: { ...readJob(card), listPage } }))
-          .filter(({ job }) => job.id);
+          .map(card => ({ card, id: jobId(card) }))
+          .filter(({ id }) => id);
         // 同一页偶尔会同时命中多个 BOSS 卡片容器选择器；页面内也要立即去重，
         // 否则同一个岗位会在 seen 更新前被算成多个“新增”。
         const pageEntries = [];
         for (const entry of identifiedPageJobs) {
-          if (seen.has(entry.job.id)) continue;
-          seen.add(entry.job.id);
+          if (seen.has(entry.id)) continue;
+          seen.add(entry.id);
           pageEntries.push(entry);
         }
         pageNew = pageEntries.length;
@@ -1078,12 +1104,24 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
         eligible += pageEntries.length;
         // 右侧 BOSS 搜索方案已负责薪资筛选；扩展不再叠加一套隐藏的薪资条件。
         const pageJobs = pageEntries
-          .filter(({ card, job }) => isVisibleCard(card) && !delivered.has(job.id))
-          .map(({ job }) => job);
-        onLog?.(`第 ${listPage + 1} 页读取完成：新增唯一岗位 ${pageEntries.length} 个，重复岗位 ${pageRepeated} 个，${pageJobs.length} 个进入 AI 筛选`);
+          .filter(({ card, id }) => !delivered.has(id) && isVisibleCard(card))
+          .map(({ card, id }) => ({ ...readJob(card, id), listPage }));
+        const cachedIds = new Set();
+        let skippedHistoricalExclusions = 0;
+        for (const job of pageJobs) {
+          const record = reusableRecords.get(String(job.id));
+          if (record?.manualOverride || validProfileResults(record, profiles, settings.screeningVersion).size > 0) {
+            cachedIds.add(job.id);
+          } else if (skipHistoricalAiExclusions && record?.match === false) {
+            cachedIds.add(job.id);
+            skippedHistoricalExclusions += 1;
+          }
+        }
+        onLog?.(`第 ${listPage + 1} 页读取完成：新增唯一岗位 ${pageNew} 个，重复 ${pageRepeated} 个，跳过 ${pageNew - pageJobs.length} 个，复用历史结果 ${cachedIds.size} 个（含旧版 AI 排除 ${skippedHistoricalExclusions} 个），待 AI 筛选 ${pageJobs.length - cachedIds.size} 个`);
         // 列表薪资使用自定义字体时，DOM 文本是编码字符；优先使用页面接口中的原始 salaryDesc。
         const candidates = (await Promise.all(pageJobs.map(async job => {
-          const meta = await getPageJobMeta(job.id);
+          // 页面桥会立即回传已有元数据。缓存命中时只取现有值，桥失联也不用等三秒。
+          const meta = await getPageJobMeta(job.id, cachedIds.has(job.id) ? 0 : undefined);
           // 在 AI 匹配前就带上直连所需的安全标识。这样匹配通过后消费者可立即
           // 启动，完整 JD 的读取仍由生产端异步补全，不互相阻塞。
           return {
@@ -1094,12 +1132,8 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
           };
         })));
         if (candidates.length) {
-          const canReuseRecord = record => Boolean(record && (
-            record.manualOverride
-            || validProfileResults(record, profiles, settings.screeningVersion).size > 0
-          ));
           const reusable = candidates
-            .filter(job => canReuseRecord(reusableRecords.get(String(job.id))))
+            .filter(job => cachedIds.has(job.id))
             .map(job => {
               const record = reusableRecords.get(String(job.id));
               return combineProfileScreeningResult({
@@ -1112,11 +1146,7 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
                 bestProfile: record.bestProfile || record.matchedProfiles?.[0] || null,
               }, record, [], settings, profiles);
             });
-          const pendingScreening = candidates.filter(job => {
-            const record = reusableRecords.get(String(job.id));
-            return !canReuseRecord(record);
-          });
-          if (reusable.length) onLog?.(`复用本地筛选记录：${reusable.length} 个岗位`);
+          const pendingScreening = candidates.filter(job => !cachedIds.has(job.id));
           let cachePipeline = Promise.resolve();
           const processScreenedJobs = async (screened, options = {}) => {
             const alreadyShown = options.alreadyShown === true;
@@ -1173,8 +1203,8 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
           if (reusable.length) await processScreenedJobs(reusable);
           const manualStartIndex = analyzed.length;
           const screened = await screenJobsInChunks(settings, pendingScreening, (current, total) => {
-            onProgress?.(progressSnapshot({ page: listPage + 1, total, phase: `正在筛选本页岗位 ${current}/${total}` }));
-          }, isCancelled, autoDelivering ? AUTO_SCREENING_CHUNK_SIZE : SCREENING_CHUNK_SIZE, async screenedChunk => {
+            onProgress?.(progressSnapshot({ page: listPage + 1, total, phase: `本页 AI 已完成 ${current}/${total}，已复用历史 ${reusable.length} 个` }));
+          }, isCancelled, autoDelivering ? 1 : SCREENING_CHUNK_SIZE, async screenedChunk => {
             const mergedChunk = await mergeAndPersistScreenedJobs(screenedChunk);
             mergedChunk.forEach(job => screenedRecordsById.set(String(job.id), job));
             if (!autoDelivering) {
@@ -1187,8 +1217,8 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
             // 每批 AI 结果先进入预览；自动投递必须等待下面的完整职位详情读取完成。
             onProgress?.(progressSnapshot({ page: listPage + 1, phase: '正在读取岗位详情' }));
             cachePipeline = cachePipeline.then(() => processScreenedJobs(mergedChunk, { alreadyShown: true, startIndex }));
-          }, onLog);
-          // 手动确认模式可统一完成本页 AI 筛选后再缓存；自动模式已在每个岗位完成筛选时处理。
+          }, onLog, autoDelivering ? AUTO_SCREENING_CONCURRENCY : 1);
+          // 手动确认模式在本页筛选完毕后缓存详情；自动模式按批处理。
           if (!autoDelivering) {
             const mergedScreened = screened.map(job => screenedRecordsById.get(String(job.id)) || job);
             await processScreenedJobs(mergedScreened, { alreadyShown: true, startIndex: manualStartIndex });
@@ -2081,15 +2111,16 @@ const isDeliveryWorkerTab = () => location.hash === DELIVERY_WORKER_HASH;
       const requestId = makeBatchSessionId();
       const handler = event => {
         if (event.detail?.requestId !== requestId) return;
+        clearTimeout(timer);
         window.removeEventListener('BQA_JOB_META_RESPONSE', handler);
         resolve(event.detail.job || null);
       };
-      window.addEventListener('BQA_JOB_META_RESPONSE', handler);
-      window.dispatchEvent(new CustomEvent('BQA_JOB_META_REQUEST', { detail: { requestId, jobId } }));
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         window.removeEventListener('BQA_JOB_META_RESPONSE', handler);
         resolve(null);
       }, timeout);
+      window.addEventListener('BQA_JOB_META_RESPONSE', handler);
+      window.dispatchEvent(new CustomEvent('BQA_JOB_META_REQUEST', { detail: { requestId, jobId } }));
     });
   }
 

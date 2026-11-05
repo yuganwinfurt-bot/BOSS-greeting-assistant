@@ -262,6 +262,7 @@
           <header class="config-section__header"><span class="config-section__icon" aria-hidden="true">◎</span><div><h3>岗位名称与 AI 匹配</h3><p>岗位名称同时作为 BOSS 搜索词；岗位要求只用于 AI 匹配，不用在右侧重复填写。</p></div><small class="screening-version">匹配机制版本号 ${escapeHtml(screeningVersion)}</small></header>
           <div class="config-section__grid">
             <div class="field wide"><span class="field-label"><span>岗位名称与岗位要求</span><em>名称用于 BOSS 搜索；岗位要求用于 AI 匹配</em></span><div class="profile-list" data-profile-list></div><button type="button" class="button" data-add-profile>＋增加岗位条件</button></div>
+            <div class="prompt-toggle-row field wide"><div><strong>跳过历史 AI 排除岗位</strong><small>下次搜索生效。即使简历或筛选条件有变化，遇到同一岗位 ID 也保留历史排除。新增岗位条件时，仍按标题和标签定向复筛。</small></div><label class="switch prompt-toggle"><input type="checkbox" name="skipHistoricalAiExclusions" aria-label="跳过历史 AI 排除岗位" ${settings.skipHistoricalAiExclusions === true ? 'checked' : ''}><i></i></label></div>
           </div>
         </section>
         <section class="config-section wide">
@@ -377,6 +378,7 @@
         resumePdfName: pendingResumePdfName,
         resumePdfPages: pendingResumePdfPages,
         screeningPrompt: data.get('screeningPrompt').trim() || DEFAULT_SCREENING_PROMPT,
+        skipHistoricalAiExclusions: data.get('skipHistoricalAiExclusions') === 'on',
         greetingPrompt: data.get('greetingPrompt').trim() || DEFAULT_GREETING_PROMPT,
         // 自定义筛选和招呼提示词始终生效；旧版本该开关已由 AI 招呼语开关取代。
         customPromptsEnabled: true,
