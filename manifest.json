@@ -3,20 +3,20 @@
       "default_title": "BOSS打招呼助手"
    },
    "background": {
-      "service_worker": "background.js"
+      "service_worker": "src/background.js"
    },
    "content_scripts": [ {
-      "css": [ "content.css" ],
-      "js": [ "chat-client.js", "job-id.js", "content.js" ],
+      "css": [ "pages/content.css" ],
+      "js": [ "src/automation-safety.js", "src/job-id.js", "src/content.js" ],
       "matches": [ "https://www.zhipin.com/*" ],
       "run_at": "document_idle"
    }, {
-      "js": [ "page-bridge.js" ],
+      "js": [ "src/automation-safety.js", "src/page-bridge.js" ],
       "matches": [ "https://www.zhipin.com/*" ],
       "run_at": "document_start",
       "world": "MAIN"
    } ],
-   "description": "AI 筛选 BOSS 岗位；可切换 AI 招呼语或使用 BOSS 原生招呼设置。",
+   "description": "AI 筛选 BOSS 岗位，保存待人工沟通的候选和招呼草稿。",
    "host_permissions": [ "\u003Call_urls>" ],
    "icons": {
       "128": "store-assets/icons/icon128.png",
@@ -27,5 +27,5 @@
    "manifest_version": 3,
    "name": "BOSS打招呼助手",
    "permissions": [ "storage", "tabs", "alarms", "unlimitedStorage", "contextMenus" ],
-   "version": "1.5.74"
+   "version": "1.5.76"
 }

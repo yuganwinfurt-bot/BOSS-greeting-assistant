@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>设置｜BOSS打招呼助手</title>
+    <link rel="stylesheet" href="settings.css">
+  </head>
+  <body>
+    <main class="settings-shell">
+      <span id="settings-notice" role="status" aria-live="polite"></span>
+      <section id="automation-safety" aria-label="运行状态">
+        <strong>运行状态 · <span data-safety-status>正在读取</span></strong>
+        <p data-safety-detail role="status"></p>
+        <button class="button" type="button" data-pause-automation hidden>暂停任务</button>
+        <button class="button" type="button" data-resume-automation hidden>继续任务</button>
+      </section>
+      <section id="manual-greeting-draft" hidden>
+        <label for="manual-greeting-text">招呼草稿 · 请核对后自行复制到 BOSS</label>
+        <textarea id="manual-greeting-text" readonly rows="4"></textarea>
+        <button class="button" type="button" data-close-draft>关闭草稿</button>
+      </section>
+      <nav class="settings-tabs" role="tablist" aria-label="设置内容">
+        <button type="button" role="tab" data-tab="basic">基础配置</button>
+        <button type="button" role="tab" data-tab="blocked">屏蔽岗位 <i id="blocked-count" hidden></i></button>
+        <button type="button" role="tab" data-tab="contacted">沟通记录 <i id="contacted-count" hidden></i></button>
+        <button type="button" role="tab" data-tab="records">识别记录</button>
+      </nav>
+      <section class="settings-panel" data-panel="basic" aria-busy="true"><p role="status">正在读取设置…</p></section>
+      <section class="settings-panel" data-panel="blocked" aria-busy="true" hidden><p role="status">正在读取历史记录…</p></section>
+      <section class="settings-panel" data-panel="contacted" aria-busy="true" hidden><p role="status">正在读取历史记录…</p></section>
+      <section class="settings-panel" data-panel="records" aria-busy="true" hidden><p role="status">正在读取历史记录…</p></section>
+    </main>
+    <script src="../src/automation-safety.js"></script>
+    <script src="../src/settings.js"></script>
+  </body>
+</html>
